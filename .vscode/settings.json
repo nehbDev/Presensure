@@ -1,0 +1,10 @@
+{
+  "tailwindCSS.experimental.classRegex": [
+    ["className\\s*=\\s*\"([^\"]*)\"", "className\\s*=\\s*'([^']*)'"],
+    ["class\\s*=\\s*\"([^\"]*)\"", "class\\s*=\\s*'([^']*)'"]
+  ],
+  "tailwindCSS.includeLanguages": {
+    "typescriptreact": "javascript",
+    "javascriptreact": "javascript"
+  }
+}
