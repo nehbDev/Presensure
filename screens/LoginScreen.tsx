@@ -6,9 +6,16 @@ import {
   Pressable,
   Image,
   ActivityIndicator,
-  Alert,
   TouchableOpacity,
+  Alert,
+  KeyboardAvoidingView,
+  Platform,
+  ScrollView,
+  TouchableWithoutFeedback,
+  Keyboard,
+  SafeAreaView,
 } from "react-native";
+import { StatusBar } from "expo-status-bar";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { Ionicons } from "@expo/vector-icons";
 import API_URL from "../api/apiConfig";
@@ -24,9 +31,7 @@ export default function LoginScreen({ navigation }: any) {
       Alert.alert("Error", "Please enter Student ID and Password");
       return;
     }
-
     setLoading(true);
-
     try {
       const response = await fetch(`${API_URL}/login`, {
         method: "POST",
@@ -47,86 +52,117 @@ export default function LoginScreen({ navigation }: any) {
         Alert.alert("Login Failed", data.message || "Invalid credentials");
       }
     } catch (error: any) {
-      Alert.alert("Error", "Could not connect to server");
       console.error("Network Error:", error.message);
+      Alert.alert("Error", "Could not connect to server");
     } finally {
       setLoading(false);
     }
   };
 
   return (
-    <View className="flex-1 bg-slate-900 justify-center px-6">
-      {/* Card */}
-      <View className="bg-white rounded-2xl shadow-2xl p-6 border border-gray-200">
-        {/* Logo + Title */}
-        <View className="items-center mb-6">
-          <Image
-            source={require("../assets/logo.webp")}
-            className="h-20 w-20 mb-3"
-            resizeMode="contain"
-          />
-          <Text className="text-xl font-bold text-gray-800">Welcome Back</Text>
-        </View>
+    <SafeAreaView style={{ flex: 1, backgroundColor: "#50A8EE" }}>
+      <KeyboardAvoidingView
+        style={{ flex: 1 }}
+        behavior={Platform.OS === "ios" ? "padding" : "height"}
+        keyboardVerticalOffset={Platform.OS === "ios" ? 60 : 0}
+      >
+        <StatusBar style="light" />
+        <TouchableWithoutFeedback onPress={Keyboard.dismiss}>
+          <ScrollView
+            contentContainerStyle={{
+              flexGrow: 1,
+              justifyContent: "center",
+              paddingHorizontal: 24,
+              paddingVertical: 40,
+            }}
+            keyboardShouldPersistTaps="handled"
+          >
+            <View className="bg-white rounded-3xl shadow-xl p-6">
+              {/* Logo + Title */}
+              <View className="items-center mb-6">
+                <Image
+                  source={require("../assets/logo.webp")}
+                  className="h-28 w-28"
+                  resizeMode="contain"
+                />
+                <Text className="text-2xl font-bold text-gray-900 mt-4">
+                  Welcome Back!
+                </Text>
+                <Text className="text-gray-500 mt-1">Sign in to continue</Text>
+              </View>
 
-        {/* Student ID */}
-        <View className="mb-4">
-          <Text className="text-xs font-medium text-gray-700 mb-1">
-            ID Number
-          </Text>
-          <View className="flex-row items-center border border-gray-300 rounded-lg px-3 py-2 bg-white">
-            <Ionicons name="id-card-outline" size={18} color="gray" />
-            <TextInput
-              className="flex-1 ml-2 text-gray-900"
-              placeholder="Enter your ID (e.g. C-2024-0001)"
-              value={studentId}
-              onChangeText={setStudentId}
-              autoCapitalize="none"
-            />
-          </View>
-        </View>
+              {/* Student ID */}
+              <View className="mb-4">
+                <View className="flex-row items-center border border-gray-300 rounded-xl px-4 py-3 bg-gray-50">
+                  <Ionicons name="id-card-outline" size={20} color="gray" />
+                  <TextInput
+                    className="flex-1 ml-3 placeholder:text-gray-400"
+                    placeholder="Student ID"
+                    value={studentId}
+                    onChangeText={setStudentId}
+                    autoCapitalize="none"
+                    returnKeyType="next"
+                  />
+                </View>
+              </View>
 
-        {/* Password */}
-        <View className="mb-6">
-          <Text className="text-xs font-medium text-gray-700 mb-1">
-            Password
-          </Text>
-          <View className="flex-row items-center border border-gray-300 rounded-lg px-3 py-2 bg-white">
-            <Ionicons name="lock-closed-outline" size={18} color="gray" />
-            <TextInput
-              className="flex-1 ml-2 text-gray-900"
-              placeholder="Enter your password"
-              secureTextEntry={!showPassword}
-              value={password}
-              onChangeText={setPassword}
-            />
-            <TouchableOpacity onPress={() => setShowPassword(!showPassword)}>
-              <Ionicons
-                name={showPassword ? "eye-off" : "eye"}
-                size={18}
-                color="gray"
-              />
-            </TouchableOpacity>
-          </View>
-        </View>
+              {/* Password */}
+              <View className="mb-6">
+                <View className="flex-row items-center border border-gray-300 rounded-xl px-4 py-3 bg-gray-50">
+                  <Ionicons name="lock-closed-outline" size={20} color="gray" />
+                  <TextInput
+                    className="flex-1 ml-3 placeholder:text-gray-400" // ✅ added text color
+                    placeholder="Password"
+                    secureTextEntry={!showPassword}
+                    value={password}
+                    onChangeText={setPassword}
+                    returnKeyType="done"
+                    textContentType="password"
+                    autoCapitalize="none"
+                    autoCorrect={false}
+                    style={{
+                      fontSize: 16,
+                      fontFamily:
+                        Platform.OS === "ios" ? "System" : "sans-serif",
+                      color: "#000", // ✅ force black text (dots too)
+                    }}
+                  />
 
-        {/* Login Button */}
-        <Pressable
-          onPress={handleLogin}
-          disabled={loading}
-          className="w-full bg-blue-600 py-3 rounded-lg"
-        >
-          {loading ? (
-            <View className="flex-row justify-center items-center">
-              <ActivityIndicator color="#fff" size="small" />
-              <Text className="text-white font-semibold ml-2">
-                Signing in...
-              </Text>
+                  <TouchableOpacity
+                    onPress={() => setShowPassword(!showPassword)}
+                  >
+                    <Ionicons
+                      name={showPassword ? "eye-off" : "eye"}
+                      size={20}
+                      color="gray"
+                    />
+                  </TouchableOpacity>
+                </View>
+              </View>
+
+              {/* Login Button */}
+              <Pressable
+                onPress={handleLogin}
+                disabled={loading}
+                className="w-full py-6 rounded-xl flex-row justify-center items-center bg-[#50A8EE]"
+              >
+                {loading ? (
+                  <View className="flex-row justify-center items-center">
+                    <ActivityIndicator color="#fff" size="small" />
+                    <Text className="text-white font-semibold ml-2">
+                      Signing in...
+                    </Text>
+                  </View>
+                ) : (
+                  <Text className="text-white font-semibold text-center">
+                    Login
+                  </Text>
+                )}
+              </Pressable>
             </View>
-          ) : (
-            <Text className="text-white font-semibold text-center">Sign In</Text>
-          )}
-        </Pressable>
-      </View>
-    </View>
+          </ScrollView>
+        </TouchableWithoutFeedback>
+      </KeyboardAvoidingView>
+    </SafeAreaView>
   );
 }

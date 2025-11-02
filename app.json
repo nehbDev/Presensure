@@ -4,25 +4,58 @@
     "slug": "Presensure",
     "version": "1.0.0",
     "orientation": "portrait",
-    "icon": "./assets/icon.png",
+    "icon": "./assets/appLogo.png",
     "userInterfaceStyle": "light",
     "newArchEnabled": true,
-    "scheme": "presensure",  
+    "scheme": "presensure",
     "splash": {
-      "image": "./assets/splash-icon.png",
+      "image": "./assets/appLogo.png",
       "resizeMode": "contain",
       "backgroundColor": "#ffffff"
     },
     "android": {
-      "package": "com.nehbcy.presensure", 
+      "package": "com.nehbcy.presensure",
       "adaptiveIcon": {
-        "foregroundImage": "./assets/adaptive-icon.png",
+        "foregroundImage": "./assets/appLogo.png",
         "backgroundColor": "#ffffff"
       },
-      "edgeToEdgeEnabled": true
+      "edgeToEdgeEnabled": true,
+      "permissions": [
+        "INTERNET",
+        "READ_EXTERNAL_STORAGE",
+        "SYSTEM_ALERT_WINDOW",
+        "VIBRATE",
+        "WRITE_EXTERNAL_STORAGE",
+        "BLUETOOTH",
+        "BLUETOOTH_ADMIN",
+        "BLUETOOTH_SCAN",
+        "BLUETOOTH_CONNECT",
+        "ACCESS_FINE_LOCATION",
+        "POST_NOTIFICATIONS",
+        "RECEIVE_BOOT_COMPLETED",
+        "CAMERA",
+        "android.permission.CAMERA",
+        "android.permission.RECORD_AUDIO"
+      ]
     },
     "web": {
       "favicon": "./assets/favicon.png"
+    },
+    "plugins": [
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Allow $(PRODUCT_NAME) to access your camera",
+          "microphonePermission": "Allow $(PRODUCT_NAME) to access your microphone",
+          "recordAudioAndroid": true
+        }
+      ],
+      "react-native-vision-camera"
+    ],
+    "extra": {
+      "eas": {
+        "projectId": "89c44473-bd1a-4e5d-a2ab-f631b58cd203"
+      }
     }
   }
 }
