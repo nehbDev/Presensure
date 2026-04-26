@@ -13,14 +13,17 @@ import {
   TouchableOpacity,
   RefreshControl,
   AppState,
+  PermissionsAndroid,
+  Platform,
   Image,
-  SectionList,
+  Alert,
+  Linking,
 } from "react-native";
 import { Device, State } from "react-native-ble-plx";
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import { Ionicons, FontAwesome5 } from "@expo/vector-icons";
+import { Ionicons } from "@expo/vector-icons";
 import { useNavigation, NavigationProp } from "@react-navigation/native";
-import API_URL from "../api/apiConfig";
+import { API_URL } from "../api/apiConfig";
 import { bleUtils, bleManager } from "../utils/bleUtils";
 import { useBLEConnection } from "../contexts/BLEConnectionContext";
 import {
@@ -35,8 +38,12 @@ import InstructorView from "../components/InstructorView";
 import StudentView from "../components/StudentView";
 import { useAlertHandler } from "../components/useAlertHandler";
 import InstructorStudentListView from "../components/InstructorStudentListView";
+import ViewScheduleSkeleton from "../components/skeleton/ViewScheduleSkeleton";
 
-// Types
+const defaultProfile = require("../assets/noProfile.webp");
+
+// --- Types ---
+
 interface Schedule {
   schedule_id: number;
   subject_code: string;
@@ -47,6 +54,13 @@ interface Schedule {
   end_time: string;
   schedule_type: string;
   instructor_name?: string;
+  instructor?: {
+    user_id: string;
+    firstname: string;
+    lastname: string;
+    formatted_name: string;
+    image_link: string | null;
+  };
 }
 
 interface Student {
@@ -60,6 +74,9 @@ interface Student {
   attendance_status?: string;
   marked_at?: string;
   image_link?: string;
+  program?: string;
+  year?: string;
+  block?: string;
 }
 
 type RootStackParamList = {
@@ -69,16 +86,21 @@ type RootStackParamList = {
   };
 };
 
-// Constants
-const SCAN_COOLDOWN_DURATION = 60000;
-const SCAN_TIMEOUT = 30000;
-const SCHEDULE_CHECK_INTERVAL = 60000;
+// --- Helper Functions ---
 
-// Helper Functions
+const dayMap: Record<string, number> = {
+  M: 1,
+  T: 2,
+  W: 3,
+  Th: 4,
+  F: 5,
+  S: 6,
+  Su: 0,
+};
+
 const parseDayCodes = (days: string): string[] => {
   const codes: string[] = [];
   let i = 0;
-
   while (i < days.length) {
     if (days.substring(i, i + 2) === "Th") {
       codes.push("Th");
@@ -94,19 +116,9 @@ const parseDayCodes = (days: string): string[] => {
   return codes;
 };
 
-const dayMap: Record<string, number> = {
-  M: 1,
-  T: 2,
-  W: 3,
-  Th: 4,
-  F: 5,
-  S: 6,
-  Su: 0,
-};
-
 const parseTimeToMinutes = (timeStr: string) => {
-  const [hoursStr, minutesStr] = timeStr.split(":");
-  return parseInt(hoursStr, 10) * 60 + parseInt(minutesStr, 10);
+  const [hours, minutes] = timeStr.split(":").map(Number);
+  return hours * 60 + minutes;
 };
 
 const isScheduleActiveNow = (schedule: Schedule): boolean => {
@@ -115,27 +127,20 @@ const isScheduleActiveNow = (schedule: Schedule): boolean => {
   const currentTimeMinutes = now.getHours() * 60 + now.getMinutes();
   const scheduleCodes = parseDayCodes(schedule.days || "");
 
-  if (!scheduleCodes.some((code) => dayMap[code] === currentDay)) {
-    return false;
-  }
+  if (!scheduleCodes.some((code) => dayMap[code] === currentDay)) return false;
 
-  const startMinutes = parseTimeToMinutes(schedule.start_time);
-  const endMinutes = parseTimeToMinutes(schedule.end_time);
+  const start = parseTimeToMinutes(schedule.start_time);
+  const end = parseTimeToMinutes(schedule.end_time);
 
-  if (endMinutes < startMinutes) {
-    return (
-      currentTimeMinutes >= startMinutes || currentTimeMinutes <= endMinutes
-    );
-  }
-
-  return currentTimeMinutes >= startMinutes && currentTimeMinutes <= endMinutes;
+  return end < start
+    ? currentTimeMinutes >= start || currentTimeMinutes <= end
+    : currentTimeMinutes >= start && currentTimeMinutes <= end;
 };
 
 const getTimeUntilSchedule = (schedule: Schedule): string => {
   const now = new Date();
   const currentDay = now.getDay();
   const scheduleCodes = parseDayCodes(schedule.days);
-
   let daysUntilNext = 0;
   let found = false;
 
@@ -173,469 +178,368 @@ const getTimeUntilSchedule = (schedule: Schedule): string => {
 };
 
 const formatTimeAMPM = (timeStr: string): string => {
-  const [hoursStr, minutesStr] = timeStr.split(":");
-  let hours = parseInt(hoursStr, 10);
-  const minutes = minutesStr || "00";
-
+  const [h, m] = timeStr.split(":");
+  let hours = parseInt(h, 10);
   const ampm = hours >= 12 ? "PM" : "AM";
-  hours = hours % 12;
-  hours = hours ? hours : 12;
-
-  return `${hours}:${minutes} ${ampm}`;
+  hours = hours % 12 || 12;
+  return `${hours}:${m || "00"} ${ampm}`;
 };
 
-// Main Component
-export default function ViewScheduleScreen({ route }: any) {
-  const { schedule }: { schedule: Schedule } = route.params;
-  const navigation = useNavigation<NavigationProp<RootStackParamList>>();
+const normalizedSubjectCode = (code: string): string =>
+  (code || "").replace(/[\s-]/g, "").trim().toLowerCase();
 
-  // State
-  const [devices, setDevices] = useState<Device[]>([]);
-  const [scanning, setScanning] = useState(false);
+// --- Memoized Child Component ---
+
+const DeviceListItem = React.memo(
+  ({
+    item,
+    schedule,
+    userRole,
+    isScheduleTime,
+    isConnected,
+    connectedDeviceId,
+  }: {
+    item: Device;
+    schedule: Schedule;
+    userRole: string | null;
+    isScheduleTime: boolean;
+    isConnected: boolean;
+    connectedDeviceId: string | undefined;
+  }) => {
+    if (userRole === "student" || !isScheduleTime) return null;
+
+    const manufacturer = bleUtils.decodeManufacturerData(
+      item.manufacturerData as string
+    );
+    const normManufacturer = normalizedSubjectCode(manufacturer || "");
+    const normRoom = normalizedSubjectCode(schedule.room);
+    const isMatch = normManufacturer === normRoom;
+    const isCurrentlyConnected = isConnected && connectedDeviceId === item.id;
+
+    return (
+      <View
+        className={`p-5 rounded-2xl shadow-sm mb-3 mx-4 ${
+          isCurrentlyConnected
+            ? "bg-blue-50 border-2 border-blue-300"
+            : isMatch
+            ? "bg-green-50 border border-green-200"
+            : "bg-white border border-gray-100"
+        } ${!isScheduleTime ? "opacity-60" : ""}`}
+      >
+        <View className="flex-row items-center">
+          <View
+            className={`p-2 rounded-full mr-3 ${
+              isCurrentlyConnected
+                ? "bg-blue-100"
+                : isMatch
+                ? "bg-green-100"
+                : "bg-gray-100"
+            }`}
+          >
+            <Ionicons
+              name="bluetooth"
+              size={20}
+              color={
+                isCurrentlyConnected
+                  ? "#3b82f6"
+                  : isMatch
+                  ? "#10b981"
+                  : "#6b7280"
+              }
+            />
+          </View>
+
+          <View className="flex-1">
+            <Text className="font-semibold text-gray-800 text-base">
+              {item.name || "Unknown Device"}
+              {isCurrentlyConnected && (
+                <Text className="text-blue-600 text-sm ml-2"> • Connected</Text>
+              )}
+            </Text>
+
+            <Text className="text-xs text-gray-500 mt-1">
+              ID: {item.id.substring(0, 8)}...
+            </Text>
+
+            {typeof item.rssi !== "undefined" && (
+              <Text className="text-xs text-gray-500 mt-1">
+                RSSI: {item.rssi} dBm
+              </Text>
+            )}
+          </View>
+
+          <View className="flex-row items-center">
+            {isCurrentlyConnected && (
+              <View className="bg-blue-100 rounded-full p-1 mr-2">
+                <Ionicons name="link" size={16} color="#3b82f6" />
+              </View>
+            )}
+            {isMatch && !isCurrentlyConnected && (
+              <View className="bg-green-100 rounded-full p-1">
+                <Ionicons name="checkmark-circle" size={20} color="#10b981" />
+              </View>
+            )}
+          </View>
+        </View>
+
+        {manufacturer && (
+          <View className="mt-3 bg-gray-50 p-2 rounded-lg">
+            <Text
+              className={`text-xs ${
+                isCurrentlyConnected
+                  ? "text-blue-600 font-medium"
+                  : isMatch
+                  ? "text-green-600 font-medium"
+                  : "text-blue-500"
+              }`}
+            >
+              Manufacturer: {manufacturer}
+              {isMatch && ` (Room Match)`}
+              {isCurrentlyConnected && ` (Connected)`}
+            </Text>
+          </View>
+        )}
+      </View>
+    );
+  },
+  (prev, next) => {
+    return (
+      prev.item.id === next.item.id &&
+      prev.item.rssi === next.item.rssi &&
+      prev.isConnected === next.isConnected &&
+      prev.connectedDeviceId === next.connectedDeviceId
+    );
+  }
+);
+
+// --- Custom Hook for Schedule Logic ---
+
+const useScheduleLogic = (schedule: Schedule) => {
+  const [isScheduleTime, setIsScheduleTime] = useState(false);
+  const [timeUntilSchedule, setTimeUntilSchedule] = useState("");
+
+  const checkTime = useCallback(() => {
+    const isActive = isScheduleActiveNow(schedule);
+    setIsScheduleTime(isActive);
+    setTimeUntilSchedule(getTimeUntilSchedule(schedule));
+    return isActive;
+  }, [schedule]);
+
+  useEffect(() => {
+    checkTime();
+    const interval = setInterval(checkTime, 60000);
+    return () => clearInterval(interval);
+  }, [checkTime]);
+
+  return { isScheduleTime, timeUntilSchedule, checkTime };
+};
+
+// --- Main Component ---
+
+export default function ViewScheduleScreen({ route }: any) {
+  const { schedule: initialSchedule }: { schedule: Schedule } = route.params;
+  const navigation = useNavigation<NavigationProp<RootStackParamList>>();
+  const { showAlert } = useAlertHandler();
+
+  const [schedule, setSchedule] = useState<Schedule>(initialSchedule);
+
+  // Contexts
+  const {
+    isConnected,
+    connectedDevice,
+    connectDevice: globalConnect,
+    disconnectDevice: globalDisconnect,
+    currentScheduleId,
+  } = useBLEConnection();
+
+  // Hook Data
+  const { isScheduleTime, timeUntilSchedule, checkTime } =
+    useScheduleLogic(schedule);
+
+  // States
   const [userRole, setUserRole] = useState<"instructor" | "student" | null>(
     null
   );
   const [sessionStatus, setSessionStatus] = useState<
     "active" | "inactive" | "unknown"
   >("unknown");
-  const [autoAttendanceMarked, setAutoAttendanceMarked] = useState(false);
-  const [loading, setLoading] = useState(true);
-  const [scanCooldown, setScanCooldown] = useState(false);
-  const [cooldownTimer, setCooldownTimer] = useState(0);
-  const [matchedDevice, setMatchedDevice] = useState<Device | null>(null);
   const [activeSessionId, setActiveSessionId] = useState<number | null>(null);
-  const [isScheduleTime, setIsScheduleTime] = useState(false);
-  const [timeUntilSchedule, setTimeUntilSchedule] = useState("");
   const [isBluetoothOn, setIsBluetoothOn] = useState(true);
-  const [studentBackgroundTaskRunning, setStudentBackgroundTaskRunning] =
-    useState(false);
+
+  // UI States
+  const [loading, setLoading] = useState(true);
+  const [initialLoading, setInitialLoading] = useState(true);
+  const [isCreatingSession, setIsCreatingSession] = useState(false);
+  const [isMarkingAttendance, setIsMarkingAttendance] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
+
+  // BLE & List States
+  const [devices, setDevices] = useState<Device[]>([]);
+  const [scanning, setScanning] = useState(false);
+
+  // Instructor Specific
   const [activeInstructorTab, setActiveInstructorTab] = useState<
     "ble" | "students"
   >("ble");
   const [students, setStudents] = useState<Student[]>([]);
   const [loadingStudents, setLoadingStudents] = useState(false);
 
+  // Student Specific
+  const [scanCooldown, setScanCooldown] = useState(false);
+  const [cooldownTimer, setCooldownTimer] = useState(0);
+  const [autoAttendanceMarked, setAutoAttendanceMarked] = useState(false);
+  const [matchedDevice, setMatchedDevice] = useState<Device | null>(null);
+  const [studentBackgroundTaskRunning, setStudentBackgroundTaskRunning] =
+    useState(false);
+
   // Refs
   const isMountedRef = useRef(true);
   const processedDevicesRef = useRef<Set<string>>(new Set());
-const scanCooldownRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-const rescanTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-const secondsRef = useRef(0);
-const scheduleCheckRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const autoAttendanceMarkedRef = useRef(autoAttendanceMarked);
+  const scanCooldownRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const rescanTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  useEffect(() => {
+    autoAttendanceMarkedRef.current = autoAttendanceMarked;
+  }, [autoAttendanceMarked]);
 
-  // Context and Hooks
-  const { showAlert } = useAlertHandler();
-  const {
-    isConnected,
-    connectedDevice,
-    connectDevice: globalConnectDevice,
-    disconnectDevice: globalDisconnectDevice,
-    currentScheduleId,
-  } = useBLEConnection();
+  // --- API Functions ---
 
-  // Memoized Values
-  const normalizedSubjectCode = useCallback((subjectCode: string): string => {
-    return (subjectCode || "").replace(/[\s-]/g, "").trim().toLowerCase();
-  }, []);
+  const fetchScheduleDetails = useCallback(async () => {
+    if (!initialSchedule.schedule_id) return;
 
-  const scheduleTimeInfo = useMemo(
-    () => ({
-      isActive: isScheduleActiveNow(schedule),
-      timeUntil: getTimeUntilSchedule(schedule),
-    }),
-    [schedule]
-  );
+    if (userRole === "instructor") setLoadingStudents(true);
 
-  // Core Functions
-  const checkScheduleTime = useCallback(() => {
-    setIsScheduleTime(scheduleTimeInfo.isActive);
-    setTimeUntilSchedule(scheduleTimeInfo.timeUntil);
-    return scheduleTimeInfo.isActive;
-  }, [scheduleTimeInfo]);
-
-  const stopScanning = useCallback(() => {
-    bleUtils.stopDeviceScan();
-    setScanning(false);
-  }, []);
-
-  const fetchStudentsForSchedule = useCallback(async () => {
-    if (!schedule.schedule_id) return;
-
-    setLoadingStudents(true);
     try {
       const response = await fetch(
-        `${API_URL}/schedules/${schedule.schedule_id}/students`,
-        {
-          method: "GET",
-          headers: {
-            Accept: "application/json",
-          },
-        }
+        `${API_URL}/schedules/${initialSchedule.schedule_id}/students`
       );
-
       const data = await response.json();
 
       if (response.ok && data.success) {
         setStudents(data.data.students || []);
-      } else {
-        setStudents([]);
-      }
-    } catch (error) {
-      setStudents([]);
-    } finally {
-      setLoadingStudents(false);
-    }
-  }, [schedule.schedule_id]);
-
-  const startScanning = useCallback(async () => {
-    if (studentBackgroundTaskRunning) {
-      showAlert(
-        "Info",
-        "Auto scanning is active. Manual scanning is disabled.",
-        "background-scanning-active"
-      );
-      return;
-    }
-
-    if (!isBluetoothOn) {
-      showAlert(
-        "Bluetooth Off",
-        "Please enable Bluetooth to scan for devices.",
-        "bluetooth-off"
-      );
-      return;
-    }
-
-    if (!isScheduleTime) {
-      showAlert(
-        "Info",
-        "Scanning is only available during class hours.",
-        "scan-time"
-      );
-      return;
-    }
-
-    if (scanCooldown) {
-      showAlert(
-        "Cooldown",
-        `Please wait ${cooldownTimer} seconds before scanning again.`,
-        "scan-cooldown"
-      );
-      return;
-    }
-
-    if (scanning) return;
-
-    // Session time check for students
-    if (userRole === "student") {
-      try {
-        const response = await fetch(
-          `${API_URL}/attendance-sessions/active?schedule_id=${schedule.schedule_id}`,
-          { method: "GET", headers: { Accept: "application/json" } }
-        );
-
-        if (response.ok) {
-          const sessionData = await response.json();
-          if (sessionData.time_expired) {
-            showAlert(
-              "Session Ended",
-              "The attendance session time has passed. Scanning is no longer available.",
-              "session-time-expired"
-            );
-            return;
-          }
-          if (!sessionData.session) {
-            showAlert(
-              "No Active Session",
-              "There is no active attendance session for this subject.",
-              "no-active-session"
-            );
-            return;
-          }
+        if (data.data.instructor) {
+          setSchedule((prev) => ({
+            ...prev,
+            instructor: data.data.instructor,
+          }));
         }
-      } catch (error) {
-        console.error("Error checking session:", error);
       }
-    }
-
-    try {
-      const filter =
-        userRole === "instructor" ? schedule.room : schedule.subject_code;
-      setDevices([]);
-      await bleUtils.startDeviceScan({
-        filterByManufacturer: filter,
-        timeout: SCAN_TIMEOUT,
-        autoConnect: userRole === "instructor",
-      });
-      setScanning(true);
     } catch (error) {
-      console.error("Failed to start scanning:", error);
-      setScanning(false);
+      console.error("Error fetching schedule details:", error);
+    } finally {
+      if (isMountedRef.current) setLoadingStudents(false);
     }
-  }, [
-    userRole,
-    schedule,
-    scanCooldown,
-    scanning,
-    isScheduleTime,
-    isBluetoothOn,
-    studentBackgroundTaskRunning,
-    cooldownTimer,
-    showAlert,
-  ]);
+  }, [initialSchedule.schedule_id, userRole]);
 
-  const startCooldownTimer = useCallback(() => {
-    if (userRole !== "student") return;
+  useEffect(() => {
+    fetchScheduleDetails();
+  }, [fetchScheduleDetails]);
 
-    setScanCooldown(true);
-    secondsRef.current = 60;
-    setCooldownTimer(secondsRef.current);
+  // --- Permission Helper ---
 
-    if (scanCooldownRef.current) clearInterval(scanCooldownRef.current);
-    if (rescanTimerRef.current) clearTimeout(rescanTimerRef.current);
+  const requestBLEPermissions = useCallback(async () => {
+    if (Platform.OS === "android") {
+      if (Platform.Version >= 31) {
+        const result = await PermissionsAndroid.requestMultiple([
+          PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN,
+          PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT,
+          PermissionsAndroid.PERMISSIONS.POST_NOTIFICATIONS,
+        ]);
 
-    scanCooldownRef.current = setInterval(() => {
-      if (secondsRef.current > 0) {
-        secondsRef.current--;
-        setCooldownTimer(secondsRef.current);
-      } else if (scanCooldownRef.current) {
-        clearInterval(scanCooldownRef.current);
+        const scanGranted =
+          result[PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN] ===
+          PermissionsAndroid.RESULTS.GRANTED;
+        const connectGranted =
+          result[PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT] ===
+          PermissionsAndroid.RESULTS.GRANTED;
+
+        return scanGranted && connectGranted;
+      } else {
+        const granted = await PermissionsAndroid.request(
+          PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION
+        );
+        return granted === PermissionsAndroid.RESULTS.GRANTED;
       }
-    }, 1000);
+    }
+    return true;
+  }, []);
 
-    rescanTimerRef.current = setTimeout(() => {
-      setScanCooldown(false);
-      setCooldownTimer(0);
-      if (scanCooldownRef.current) clearInterval(scanCooldownRef.current);
-      processedDevicesRef.current.clear();
-      setAutoAttendanceMarked(false);
-      setMatchedDevice(null);
+  const checkExistingAttendanceAndStartBackground = async (
+    studentId: number,
+    sessionId: number,
+    currentSchedule: Schedule
+  ) => {
+    try {
+      const response = await fetch(
+        `${API_URL}/attendance/check?student_id=${studentId}&session_id=${sessionId}`
+      );
 
-      if (sessionStatus === "active" && isScheduleTime) {
-        startScanning();
-      }
-    }, SCAN_COOLDOWN_DURATION);
-  }, [userRole, sessionStatus, isScheduleTime, startScanning]);
-
-  const markStudentAttendance = useCallback(
-    async (manufacturerData: string, deviceId: string, rssi: number | null) => {
-      if (!isScheduleTime || !activeSessionId) return;
-
-      stopScanning();
-
-      try {
-        const userData = await AsyncStorage.getItem("user");
-        if (!userData) return;
-
-        const parsedUser = JSON.parse(userData);
-        const decodedManufacturer =
-          bleUtils.decodeManufacturerData(manufacturerData);
-
-        const response = await fetch(`${API_URL}/attendance/ble-mark`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            student_id: parsedUser.id,
-            subject_code: schedule.subject_code,
-            session_id: activeSessionId,
-            ble_manufacturer_data: decodedManufacturer,
-            rssi_value: rssi,
-          }),
-        });
-
+      if (response.ok) {
         const result = await response.json();
 
-        if (response.ok) {
-          showAlert("✅ Success", result.message, "attendance-success");
+        if (result.hasAttendance) {
           setAutoAttendanceMarked(true);
-          await startStudentScanningTask(
-            schedule.subject_code,
-            schedule.schedule_id,
-            parsedUser.id
-          );
-          setStudentBackgroundTaskRunning(true);
-          stopScanning();
-        } else if (response.status === 409 && result.duplicate) {
-          showAlert(
-            "ℹ️ Info",
-            "Attendance already recorded - continuing BLE monitoring",
-            "attendance-duplicate"
-          );
-          setAutoAttendanceMarked(true);
-          if (!studentBackgroundTaskRunning) {
-            await startStudentScanningTask(
-              schedule.subject_code,
-              schedule.schedule_id,
-              parsedUser.id
-            );
+
+          // ✅ NEW: Check if the student's excuse was approved
+          const isExcused = result.attendance?.status?.toLowerCase() === "excused";
+          
+          const currentTask = await getCurrentStudentTask();
+          const isRunning = await isStudentTaskRunning();
+
+          // ✅ NEW: If excused, actively stop and prevent any BLE scanning
+          if (isExcused) {
+            if (isRunning) {
+              await stopStudentScanningTask();
+            }
+            setStudentBackgroundTaskRunning(false);
+            stopScanning(); // Ensure foreground scan is also stopped
+            console.log("Student is excused. BLE scanning completely disabled.");
+            return; // Exit early, do not ask for permissions or start task
+          }
+
+          // Existing logic for Present/Late students
+          if (
+            (currentTask &&
+              currentTask.scheduleId === currentSchedule.schedule_id) ||
+            !isRunning
+          ) {
+            const hasPermissions = await requestBLEPermissions();
+            if (hasPermissions) {
+              await startStudentScanningTask(
+                currentSchedule.subject_code,
+                currentSchedule.schedule_id,
+                studentId
+              );
+              setStudentBackgroundTaskRunning(true);
+            } else {
+              console.warn(
+                "Permissions denied, cannot start student background task"
+              );
+            }
+          } else {
             setStudentBackgroundTaskRunning(true);
           }
         } else {
-          showAlert(
-            "Error",
-            result.message || "Failed to mark attendance",
-            "attendance-error"
-          );
+          setAutoAttendanceMarked(false);
         }
-      } catch (error) {
-        console.error("Error marking attendance:", error);
-        showAlert("Error", "Failed to mark attendance", "attendance-error");
       }
-    },
-    [
-      activeSessionId,
-      schedule,
-      stopScanning,
-      isScheduleTime,
-      studentBackgroundTaskRunning,
-      showAlert,
-    ]
-  );
-
-  const handleBLEDetection = useCallback(
-    async (manufacturerData: string, deviceId: string, rssi: number | null) => {
-      if (!isScheduleTime || !activeSessionId) return;
-
-      stopScanning();
-
-      navigation.navigate("FaceVerify", {
-        schedule: schedule,
-        onVerificationSuccess: async (verificationResult: boolean) => {
-          if (verificationResult) {
-            await markStudentAttendance(manufacturerData, deviceId, rssi);
-          } else {
-            showAlert(
-              "Verification Failed",
-              "Face verification failed. Please try again.",
-              "face-verification-failed"
-            );
-            startScanning();
-          }
-        },
-      });
-    },
-    [
-      activeSessionId,
-      schedule,
-      stopScanning,
-      isScheduleTime,
-      markStudentAttendance,
-      startScanning,
-      showAlert,
-      navigation,
-    ]
-  );
-
-  const recordBLEDetection = useCallback(
-    async (rssi: number | null) => {
-      if (!isScheduleTime || !activeSessionId || !autoAttendanceMarked) return;
-
-      try {
-        const userData = await AsyncStorage.getItem("user");
-        if (!userData) return;
-
-        const parsedUser = JSON.parse(userData);
-        await fetch(`${API_URL}/attendance/ble-detection`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            student_id: parsedUser.id,
-            session_id: activeSessionId,
-            rssi_value: rssi,
-          }),
-        });
-      } catch (error) {
-        console.error("Error recording BLE detection:", error);
-      }
-    },
-    [activeSessionId, isScheduleTime, autoAttendanceMarked]
-  );
-
-  const connectToDevice = useCallback(
-    async (device: Device) => {
-      if (userRole === "student" && !isScheduleTime) {
-        showAlert(
-          "Info",
-          "Device connection is only available during class hours.",
-          "connect-hours"
-        );
-        return;
-      }
-
-      try {
-        if (isConnected && connectedDevice?.id === device.id) return;
-
-        if (
-          isConnected &&
-          connectedDevice &&
-          connectedDevice.id !== device.id
-        ) {
-          await globalDisconnectDevice();
-        }
-
-        await bleUtils.connectToDevice(device);
-      } catch (error) {
-        console.error("Error connecting to device:", error);
-      }
-    },
-    [
-      userRole,
-      isConnected,
-      connectedDevice,
-      globalDisconnectDevice,
-      isScheduleTime,
-      showAlert,
-    ]
-  );
-
-  const handleManualRescan = useCallback(() => {
-    if (studentBackgroundTaskRunning) {
-      showAlert(
-        "Info",
-        "Auto scanning is active. Manual rescan is disabled.",
-        "background-scanning-active"
-      );
-      return;
-    }
-
-    if (!isScheduleTime) {
-      showAlert(
-        "Info",
-        "Scanning is only available during class hours.",
-        "rescan-time"
-      );
-      return;
-    }
-
-    setScanCooldown(false);
-    setCooldownTimer(0);
-    if (scanCooldownRef.current) clearInterval(scanCooldownRef.current);
-    if (rescanTimerRef.current) clearTimeout(rescanTimerRef.current);
-    processedDevicesRef.current.clear();
-    setAutoAttendanceMarked(false);
-    setMatchedDevice(null);
-    startScanning();
-  }, [startScanning, isScheduleTime, studentBackgroundTaskRunning, showAlert]);
-
-  const handleDisconnect = async (): Promise<void> => {
-    try {
-      await stopInstructorTask();
-      await globalDisconnectDevice();
-      stopScanning();
-      setScanning(false);
-      setMatchedDevice(null);
-      setDevices([]);
     } catch (error) {
-      console.error("Error during disconnect:", error);
+      console.error("Error checking existing attendance:", error);
     }
   };
 
   const loadUserData = useCallback(async () => {
     try {
+      if (!refreshing) setInitialLoading(true);
+
+      const hasPermissions = await requestBLEPermissions();
+
       const userData = await AsyncStorage.getItem("user");
+
       if (!userData) {
         setLoading(false);
+        setInitialLoading(false);
         return;
       }
 
@@ -646,595 +550,529 @@ const scheduleCheckRef = useRef<ReturnType<typeof setTimeout> | null>(null);
       const params = new URLSearchParams({
         schedule_id: schedule.schedule_id.toString(),
       });
+
       const response = await fetch(
-        `${API_URL}/attendance-sessions/active?${params.toString()}`,
-        {
-          method: "GET",
-          headers: { Accept: "application/json" },
-        }
+        `${API_URL}/attendance-sessions/active?${params}`,
+        { headers: { Accept: "application/json" } }
       );
 
       if (response.ok) {
         const data = await response.json();
-        if (data.session && data.session !== null) {
-          const sessionId = data.session.attendance_session_id;
-          if (sessionId) {
-            setSessionStatus("active");
-            setActiveSessionId(sessionId);
 
-            if (parsedUser.role === "student") {
-              await checkExistingAttendanceAndStartBackground(
-                parsedUser.id,
-                sessionId,
-                schedule
+        if (data.session?.attendance_session_id) {
+          const sid = data.session.attendance_session_id;
+          setSessionStatus("active");
+          setActiveSessionId(sid);
+
+          if (parsedUser.role === "student") {
+            await checkExistingAttendanceAndStartBackground(
+              parsedUser.id,
+              sid,
+              schedule
+            );
+          }
+
+          if (
+            parsedUser.role === "instructor" &&
+            isConnected &&
+            currentScheduleId === schedule.schedule_id
+          ) {
+            if (hasPermissions) {
+              await startInstructorTask(
+                schedule.subject_code,
+                schedule.schedule_id
               );
+            } else {
+              console.warn("Permissions denied, cannot resume instructor task");
             }
-
-            if (
-              parsedUser.role === "instructor" &&
-              isConnected &&
-              currentScheduleId === schedule.schedule_id
-            ) {
-              try {
-                await startInstructorTask(schedule.subject_code);
-              } catch (error) {
-                console.error(
-                  "Failed to start instructor background task:",
-                  error
-                );
-              }
-            }
-          } else {
-            setSessionStatus("inactive");
-            setActiveSessionId(null);
           }
         } else {
           setSessionStatus("inactive");
           setActiveSessionId(null);
         }
-      } else {
-        setSessionStatus("unknown");
       }
     } catch (error) {
       console.error("Error loading user data:", error);
-      setSessionStatus("unknown");
     } finally {
-      if (isMountedRef.current) setLoading(false);
-    }
-  }, [schedule.schedule_id, isConnected, currentScheduleId]);
-
-  const checkExistingAttendanceAndStartBackground = async (
-    studentId: number,
-    sessionId: number,
-    currentSchedule: Schedule
-  ) => {
-    try {
-      const attendanceCheck = await fetch(
-        `${API_URL}/attendance/check?student_id=${studentId}&session_id=${sessionId}`
-      );
-      if (attendanceCheck.ok) {
-        const attendanceResult = await attendanceCheck.json();
-        if (attendanceResult.hasAttendance) {
-          setAutoAttendanceMarked(true);
-          const currentTask = await getCurrentStudentTask();
-          const isRunning = await isStudentTaskRunning();
-
-          if (
-            currentTask &&
-            currentTask.scheduleId === currentSchedule.schedule_id
-          ) {
-            setStudentBackgroundTaskRunning(true);
-          } else if (!isRunning) {
-            await startStudentScanningTask(
-              currentSchedule.subject_code,
-              currentSchedule.schedule_id,
-              studentId
-            );
-            setStudentBackgroundTaskRunning(true);
-          } else {
-            setStudentBackgroundTaskRunning(true);
-          }
-        } else {
-          setAutoAttendanceMarked(false);
-        }
-      } else {
-        setAutoAttendanceMarked(false);
+      if (isMountedRef.current) {
+        setLoading(false);
+        setInitialLoading(false);
       }
-    } catch (error) {
-      console.error("Error checking attendance:", error);
-      setAutoAttendanceMarked(false);
     }
-  };
+  }, [
+    schedule.schedule_id,
+    isConnected,
+    currentScheduleId,
+    requestBLEPermissions,
+    refreshing,
+  ]);
 
-  const onDeviceConnected = useCallback(
-    async (device: Device) => {
-      if (userRole !== "instructor" || !isScheduleTime) return;
+  const onRefresh = useCallback(async () => {
+    setRefreshing(true);
+    try {
+      await Promise.all([loadUserData(), fetchScheduleDetails()]);
+      checkTime();
+    } catch (error) {
+      console.error("Refresh failed:", error);
+    } finally {
+      setRefreshing(false);
+    }
+  }, [loadUserData, fetchScheduleDetails, checkTime]);
+
+
+  const startScanning = useCallback(async () => {
+    const hasPermissions = await requestBLEPermissions();
+    if (!hasPermissions) {
+      showAlert(
+        "Permission Required",
+        "Bluetooth Connect & Scan permissions are required.",
+        "bluetooth-off"
+      );
+      return;
+    }
+
+    if (studentBackgroundTaskRunning) {
+      showAlert(
+        "Info",
+        "Auto scanning is active.",
+        "background-scanning-active"
+      );
+      return;
+    }
+
+    if (!isBluetoothOn) {
+      showAlert("Bluetooth Off", "Please enable Bluetooth.", "bluetooth-off");
+      return;
+    }
+
+    if (!isScheduleTime) {
+      showAlert("Info", "Scanning only available during class.", "scan-time");
+      return;
+    }
+
+    if (scanCooldown) {
+      showAlert("Cooldown", `Please wait ${cooldownTimer}s.`, "scan-cooldown");
+      return;
+    }
+
+    if (userRole === "student") {
 
       try {
-        await bleUtils.writeToCharacteristic(
-          device.id,
-          "4fafc201-1fb5-459e-8fcc-c5c9c331914b",
-          "beb5483e-36e1-4688-b7f5-ea07361b26a8",
-          schedule.subject_code
+        const res = await fetch(
+          `${API_URL}/attendance-sessions/active?schedule_id=${schedule.schedule_id}`
         );
+        const data = await res.json();
 
-        await globalConnectDevice(device, schedule.schedule_id);
+        if (data.time_expired) {
+          showAlert("Session Ended", "Time has passed.", "expired");
+          return;
+        }
 
-        const userData = await AsyncStorage.getItem("user");
-        if (!userData) throw new Error("No user data found");
+        if (!data.session) {
+          showAlert("No Active Session", "No session found.", "no-session");
+          return;
+        }
+      } catch (e) {
+        console.error(e);
+      }
+    }
 
-        const parsedUser = JSON.parse(userData);
-        const response = await fetch(`${API_URL}/attendance-sessions`, {
+    setScanning(true);
+    setDevices([]);
+
+    try {
+      await bleUtils.startDeviceScan({
+        filterByManufacturer:
+          userRole === "instructor" ? schedule.room : schedule.subject_code,
+        timeout: 30000,
+        autoConnect: userRole === "instructor",
+      });
+    } catch (e) {
+      setScanning(false);
+    }
+  }, [
+    studentBackgroundTaskRunning,
+    isBluetoothOn,
+    isScheduleTime,
+    scanCooldown,
+    cooldownTimer,
+    userRole,
+    schedule,
+    requestBLEPermissions,
+  ]);
+
+  const stopScanning = useCallback(() => {
+    bleUtils.stopDeviceScan();
+    setScanning(false);
+  }, []);
+
+  const handleManualRescan = useCallback(() => {
+    if (studentBackgroundTaskRunning)
+      return showAlert("Info", "Auto scanning active.");
+
+    if (!isScheduleTime) return showAlert("Info", "Class time only.");
+
+    setScanCooldown(false);
+    setCooldownTimer(0);
+    if (scanCooldownRef.current) clearInterval(scanCooldownRef.current);
+    if (rescanTimerRef.current) clearTimeout(rescanTimerRef.current);
+
+    processedDevicesRef.current.clear();
+    setAutoAttendanceMarked(false);
+    setMatchedDevice(null);
+    startScanning();
+  }, [studentBackgroundTaskRunning, isScheduleTime, startScanning]);
+
+  const markStudentAttendance = useCallback(
+    async (manufacturerData: string, deviceId: string, rssi: number | null) => {
+      if (!activeSessionId) return;
+
+      setIsMarkingAttendance(true);
+      stopScanning();
+
+      try {
+        const user = JSON.parse((await AsyncStorage.getItem("user")) || "{}");
+        const decoded = bleUtils.decodeManufacturerData(manufacturerData);
+
+        const response = await fetch(`${API_URL}/attendance/ble-mark`, {
           method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Accept: "application/json",
-          },
+          headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
-            schedule_id: schedule.schedule_id,
-            user_id: parsedUser.id,
-            status: "ongoing",
+            student_id: user.id,
+            subject_code: schedule.subject_code,
+            session_id: activeSessionId,
+            ble_manufacturer_data: decoded,
+            rssi_value: rssi,
           }),
         });
 
         const result = await response.json();
 
-        if (!response.ok) {
-          if (response.status === 409 && result.duplicate) {
-            const sessionId =
-              result.session_id || result.data?.attendance_session_id;
-            setSessionStatus("active");
-            setActiveSessionId(sessionId);
-            showAlert(
-              "Success",
-              "Attendance session continued!",
-              "session-continued"
-            );
-          } else {
-            throw new Error(
-              result.message || "Failed to create attendance session"
-            );
-          }
-        } else {
-          const sessionId =
-            result.data?.id ||
-            result.data?.attendance_session_id ||
-            result.session_id;
-          await startInstructorTask(schedule.subject_code);
-          setSessionStatus("active");
-          setActiveSessionId(sessionId);
+        if (response.ok) {
+          showAlert("✅ Success", result.message, "attendance-success");
+          setAutoAttendanceMarked(true);
 
-          if (result.duplicate) {
-            showAlert(
-              "Success",
-              "Attendance session continued!",
-              "session-continued"
+          const hasPermissions = await requestBLEPermissions();
+          if (hasPermissions) {
+            await startStudentScanningTask(
+              schedule.subject_code,
+              schedule.schedule_id,
+              user.id
             );
-          } else {
-            showAlert(
-              "Success",
-              "Attendance session started successfully!",
-              "session-start"
-            );
+            setStudentBackgroundTaskRunning(true);
           }
+        } else if (response.status !== 409) {
+          showAlert("Error", result.message, "attendance-error");
         }
-      } catch (error) {
-        console.error("Error in onDeviceConnected:", error);
-        showAlert(
-          "Error",
-          "Failed to start attendance session",
-          "session-error"
-        );
+      } catch (e) {
+        showAlert("Error", "Failed to mark attendance.");
+      } finally {
+        setIsMarkingAttendance(false);
       }
     },
-    [userRole, schedule, globalConnectDevice, isScheduleTime, showAlert]
+    [activeSessionId, schedule, stopScanning, requestBLEPermissions]
   );
 
-  const onDeviceDisconnected = useCallback(() => {
-    if (userRole === "instructor") {
-      globalDisconnectDevice();
-      setSessionStatus("inactive");
-      stopInstructorTask();
+  const handleInstructorConnect = async (device: Device) => {
+    setIsCreatingSession(true);
+    stopScanning();
+
+    try {
+      const userData = await AsyncStorage.getItem("user");
+      const user = userData ? JSON.parse(userData) : null;
+
+      if (!user || !user.id) {
+        throw new Error("User ID not found. Please log in again.");
+      }
+
+      await globalConnect(device, schedule.schedule_id);
+
+      await new Promise<void>((resolve) => setTimeout(() => resolve(), 1000));
+
+      await bleUtils.writeToCharacteristic(
+        device.id,
+        "4fafc201-1fb5-459e-8fcc-c5c9c331914b",
+        "beb5483e-36e1-4688-b7f5-ea07361b26a8",
+        "presensure"
+      );
+
+      await new Promise<void>((resolve) => setTimeout(() => resolve(), 500));
+
+      await bleUtils.writeToCharacteristic(
+        device.id,
+        "4fafc201-1fb5-459e-8fcc-c5c9c331914b",
+        "beb5483e-36e1-4688-b7f5-ea07361b26a8",
+        schedule.subject_code
+      );
+
+      const res = await fetch(`${API_URL}/attendance-sessions`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          schedule_id: schedule.schedule_id,
+          user_id: user.id,
+          device_id: device.id,
+          status: "ongoing",
+        }),
+      });
+
+      const data = await res.json();
+
+      if (res.ok || (res.status === 409 && data.duplicate)) {
+        const sid =
+          data.session_id || data.data?.attendance_session_id || data.data?.id;
+        setActiveSessionId(sid);
+        setSessionStatus("active");
+
+        const hasPermissions = await requestBLEPermissions();
+        if (hasPermissions) {
+          await startInstructorTask(
+            schedule.subject_code,
+            schedule.schedule_id
+          );
+          showAlert("Success", "Attendance Started", "session-start");
+        } else {
+          showAlert(
+            "Warning",
+            "Session started but background task failed (No Permission)"
+          );
+        }
+      } else {
+        throw new Error(data.message || "Failed to create session on server");
+      }
+    } catch (e: any) {
+      console.error("Session Start Error:", e);
+      globalDisconnect();
+      showAlert("Connection Error", e.message || "Failed to start session.");
+      startScanning();
+    } finally {
+      setIsCreatingSession(false);
     }
-  }, [userRole, globalDisconnectDevice]);
+  };
 
   const completeSession = async (sessionId: number) => {
     try {
-      const response = await fetch(`${API_URL}/attendance-sessions/complete`, {
+      const res = await fetch(`${API_URL}/attendance-sessions/complete`, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Accept: "application/json",
-        },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ session_id: sessionId }),
       });
 
-      if (!response.ok) {
-        const errorData = await response.json();
-        throw new Error(errorData.message || "Failed to complete session");
+      if (res.ok) {
+        showAlert("Success", "Session Completed", "completed");
+        setSessionStatus("inactive");
+        setActiveSessionId(null);
+        await stopInstructorTask();
+        globalDisconnect();
       }
-
-      const result = await response.json();
-      showAlert(
-        "Success",
-        "Attendance session completed successfully!",
-        "session-completed"
-      );
-      setSessionStatus("inactive");
-      setActiveSessionId(null);
-      return result;
-    } catch (error) {
-      console.error("Error completing session:", error);
-      showAlert("Error", "Failed to complete session", "session-error");
-      throw error;
+    } catch (e) {
+      showAlert("Error", "Failed to complete session");
     }
   };
 
   const cancelSession = async (sessionId: number) => {
     try {
-      const response = await fetch(`${API_URL}/attendance-sessions/cancel`, {
+      const res = await fetch(`${API_URL}/attendance-sessions/cancel`, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Accept: "application/json",
-        },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ session_id: sessionId }),
       });
 
-      if (!response.ok) {
-        const errorData = await response.json();
-        throw new Error(errorData.message || "Failed to cancel session");
+      if (res.ok) {
+        showAlert("Success", "Session Canceled", "canceled");
+        setSessionStatus("inactive");
+        setActiveSessionId(null);
+        await stopInstructorTask();
+        globalDisconnect();
       }
-
-      const result = await response.json();
-      showAlert(
-        "Success",
-        "Attendance session canceled successfully!",
-        "session-canceled"
-      );
-      setSessionStatus("inactive");
-      setActiveSessionId(null);
-      return result;
-    } catch (error) {
-      console.error("Error canceling session:", error);
-      showAlert("Error", "Failed to cancel session", "session-error");
-      throw error;
+    } catch (e) {
+      showAlert("Error", "Failed to cancel session");
     }
   };
 
-  const checkSessionTimeAndStopScanning = useCallback(async () => {
-    if (userRole !== "student" || !activeSessionId || !schedule.schedule_id)
-      return;
+  // --- Effects ---
 
-    try {
-      const response = await fetch(
-        `${API_URL}/attendance-sessions/active?schedule_id=${schedule.schedule_id}`,
-        { method: "GET", headers: { Accept: "application/json" } }
-      );
-
-      if (response.ok) {
-        const sessionData = await response.json();
-        if (sessionData.time_expired) {
-          if (studentBackgroundTaskRunning) {
-            await stopStudentScanningTask();
-            setStudentBackgroundTaskRunning(false);
-          }
-
-          stopScanning();
-          setScanning(false);
-          setScanCooldown(false);
-          setSessionStatus("inactive");
-
-          showAlert(
-            "Session Ended",
-            "The attendance session time has passed. Scanning has been stopped.",
-            "session-time-expired"
-          );
-        }
-      }
-    } catch (error) {
-      console.error("Error checking session time:", error);
-    }
-  }, [
-    userRole,
-    activeSessionId,
-    schedule.schedule_id,
-    studentBackgroundTaskRunning,
-    stopScanning,
-    showAlert,
-  ]);
-
-  // Effects
   useEffect(() => {
-    let isSubscribed = true;
-
-    const initializeScreen = async () => {
-      try {
-        await loadUserData();
-        if (isSubscribed) {
-          checkScheduleTime();
-          scheduleCheckRef.current = setInterval(
-            checkScheduleTime,
-            SCHEDULE_CHECK_INTERVAL
-          );
-        }
-      } catch (error) {
-        console.error("Error initializing screen:", error);
-        if (isSubscribed && isMountedRef.current) setLoading(false);
-      }
+    const init = async () => {
+      await loadUserData();
+      checkTime();
     };
 
-    initializeScreen();
+    init();
 
-    const subscription = AppState.addEventListener("change", (nextAppState) => {
-      if (nextAppState === "active" && isSubscribed) {
+    const sub = AppState.addEventListener("change", (state) => {
+      if (state === "active") {
         loadUserData();
-        checkScheduleTime();
+        checkTime();
       }
     });
 
-    return () => {
-      isSubscribed = false;
-      isMountedRef.current = false;
-      bleUtils.stopDeviceScan();
+    const bleSub = bleManager.onStateChange((state) => {
+      setIsBluetoothOn(state === State.PoweredOn);
+    }, true);
 
+    return () => {
+      isMountedRef.current = false;
+      sub.remove();
+      bleSub.remove();
+      bleUtils.stopDeviceScan();
       if (scanCooldownRef.current) clearInterval(scanCooldownRef.current);
       if (rescanTimerRef.current) clearTimeout(rescanTimerRef.current);
-      if (scheduleCheckRef.current) clearInterval(scheduleCheckRef.current);
-
-      subscription.remove();
     };
   }, []);
 
-  // Fix: Fetch students when instructor tab is active, regardless of session status
   useEffect(() => {
-    if (userRole === "instructor" && activeInstructorTab === "students") {
-      fetchStudentsForSchedule();
-    }
-  }, [activeInstructorTab, userRole, fetchStudentsForSchedule]);
-
-  useEffect(() => {
-    const callbacks = {
-      onDeviceFound: (device: Device) => {
+    bleUtils.setCallbacks({
+      onDeviceFound: (device) => {
         setDevices((prev) => {
-          const idx = prev.findIndex((d) => d.id === device.id);
-          if (idx >= 0) {
-            const copy = [...prev];
-            copy[idx] = { ...device, rssi: device.rssi } as Device;
-            return copy;
+          const index = prev.findIndex((d) => d.id === device.id);
+          if (index !== -1) {
+            const newDevices = [...prev];
+            newDevices[index] = device;
+            return newDevices;
           }
           return [...prev, device];
         });
 
-        if (studentBackgroundTaskRunning) return;
+        if (processedDevicesRef.current.has(device.id)) return;
 
-        if (
-          userRole === "student" &&
-          sessionStatus === "active" &&
-          isScheduleTime &&
-          device.manufacturerData
-        ) {
-          const manufacturer = bleUtils.decodeManufacturerData(
-            device.manufacturerData
+        // Student Logic
+        if (userRole === "student" && isScheduleTime && activeSessionId) {
+          const manu = bleUtils.decodeManufacturerData(
+            device.manufacturerData || ""
           );
-          if (manufacturer) {
-            const normalizedManufacturer = normalizedSubjectCode(manufacturer);
-            const normalizedStudentSubject = normalizedSubjectCode(
-              schedule.subject_code
-            );
 
-            if (normalizedManufacturer === normalizedStudentSubject) {
-              const deviceKey = `${device.id}-${Date.now()}`;
-              if (!processedDevicesRef.current.has(deviceKey)) {
-                processedDevicesRef.current.add(deviceKey);
-                setTimeout(
-                  () => processedDevicesRef.current.delete(deviceKey),
-                  5000
-                );
+          if (
+            normalizedSubjectCode(manu || "") ===
+            normalizedSubjectCode(schedule.subject_code)
+          ) {
+            processedDevicesRef.current.add(device.id);
+            setMatchedDevice(device);
 
-                setMatchedDevice(device);
-
-                if (!autoAttendanceMarked) {
-                  handleBLEDetection(
-                    device.manufacturerData,
-                    device.id,
-                    device.rssi || null
-                  );
-                } else {
-                  recordBLEDetection(device.rssi || null);
-                }
-              }
+            if (!autoAttendanceMarkedRef.current) {
+              stopScanning();
+              navigation.navigate("FaceVerify", {
+                schedule,
+                onVerificationSuccess: async (verified: boolean) => {
+                  if (verified)
+                    await markStudentAttendance(
+                      device.manufacturerData!,
+                      device.id,
+                      device.rssi!
+                    );
+                  else {
+                    showAlert("Failed", "Verification Failed");
+                    startScanning();
+                  }
+                },
+              });
+            } else {
+              console.log(
+                "Device found in foreground, letting background task handle record."
+              );
             }
           }
         }
 
+        // Instructor Logic
         if (
           userRole === "instructor" &&
-          isScheduleTime &&
           !isConnected &&
           sessionStatus !== "active"
         ) {
-          const manufacturer = bleUtils.decodeManufacturerData(
-            device.manufacturerData
+          const manu = bleUtils.decodeManufacturerData(
+            device.manufacturerData || ""
           );
-          if (manufacturer) {
-            const normalizedManufacturer = normalizedSubjectCode(manufacturer);
-            const normalizedRoom = normalizedSubjectCode(schedule.room);
-            if (normalizedManufacturer === normalizedRoom) {
-              setMatchedDevice(device);
-              connectToDevice(device);
-            }
+
+          if (
+            normalizedSubjectCode(manu || "") ===
+            normalizedSubjectCode(schedule.room)
+          ) {
+            processedDevicesRef.current.add(device.id);
+            setMatchedDevice(device);
+            handleInstructorConnect(device);
           }
         }
       },
-      onDeviceConnected,
-      onDeviceDisconnected,
-      onError: (error: any) => console.error("BLE Error:", error),
-      onScanStarted: () => setScanning(true),
       onScanStopped: () => setScanning(false),
-    };
+    });
 
-    bleUtils.setCallbacks(callbacks);
     return () => bleUtils.setCallbacks({});
   }, [
     userRole,
+    isScheduleTime,
+    activeSessionId,
+    isConnected,
     sessionStatus,
     schedule,
-    handleBLEDetection,
-    recordBLEDetection,
-    normalizedSubjectCode,
-    isScheduleTime,
-    autoAttendanceMarked,
-    studentBackgroundTaskRunning,
-    isConnected,
-    connectToDevice,
-    onDeviceConnected,
-    onDeviceDisconnected,
   ]);
 
+  // Session Time Check Interval
   useEffect(() => {
-    if (isConnected && connectedDevice && userRole === "instructor") {
-      setSessionStatus("active");
-    } else if (
-      !isConnected &&
-      userRole === "instructor" &&
-      sessionStatus === "active"
-    ) {
-      setSessionStatus("inactive");
-    }
-  }, [
-    isConnected,
-    connectedDevice,
-    userRole,
-    sessionStatus,
-    schedule.subject_code,
-  ]);
+    if (!isScheduleTime || !activeSessionId || !schedule.schedule_id) return;
 
-  useEffect(() => {
-    if (
-      userRole === "student" &&
-      sessionStatus === "active" &&
-      isScheduleTime
-    ) {
-      const sessionTimeCheckInterval = setInterval(() => {
-        checkSessionTimeAndStopScanning();
-      }, 60000);
-
-      return () => clearInterval(sessionTimeCheckInterval);
-    }
-  }, [
-    userRole,
-    sessionStatus,
-    isScheduleTime,
-    checkSessionTimeAndStopScanning,
-  ]);
-
-  useEffect(() => {
-    const checkBluetoothState = async () => {
+    const interval = setInterval(async () => {
       try {
-        const state = await bleManager.state();
-        setIsBluetoothOn(state === State.PoweredOn);
-      } catch (error) {
-        console.error("Error checking Bluetooth state:", error);
-        setIsBluetoothOn(false);
+        const res = await fetch(
+          `${API_URL}/attendance-sessions/active?schedule_id=${schedule.schedule_id}`
+        );
+        const data = await res.json();
+
+        if (data.time_expired) {
+          showAlert("Ended", "Session time expired.", "expired");
+          setSessionStatus("inactive");
+          setActiveSessionId(null);
+          stopScanning();
+
+          if (userRole === "instructor") {
+            await stopInstructorTask();
+            globalDisconnect();
+          } else if (studentBackgroundTaskRunning) {
+            await stopStudentScanningTask();
+            setStudentBackgroundTaskRunning(false);
+          }
+        }
+      } catch (e) {
+        console.error(e);
       }
-    };
+    }, 60000);
 
-    checkBluetoothState();
+    return () => clearInterval(interval);
+  }, [
+    isScheduleTime,
+    activeSessionId,
+    schedule.schedule_id,
+    userRole,
+    studentBackgroundTaskRunning,
+  ]);
 
-    const subscription = bleManager.onStateChange((state) => {
-      setIsBluetoothOn(state === State.PoweredOn);
-    }, true);
+  // ✅ ADDED: Missing filteredDevices memo
+  const filteredDevices = useMemo(() => {
+    return isScheduleTime && isBluetoothOn && !scanCooldown ? devices : [];
+  }, [isScheduleTime, isBluetoothOn, scanCooldown, devices]);
 
-    return () => subscription.remove();
-  }, []);
+  // --- RENDER ---
 
-  const DeviceListItem = useMemo(
-    () =>
-      ({ item }: { item: Device }) => {
-        if (userRole === "student" || !isScheduleTime) return null;
+  if (initialLoading) {
+    return <ViewScheduleSkeleton />;
+  }
 
-        const manufacturer = bleUtils.decodeManufacturerData(
-          item.manufacturerData as string
-        );
-        const normalizedManufacturer = normalizedSubjectCode(
-          manufacturer || ""
-        );
-        const normalizedRoom = normalizedSubjectCode(schedule.room);
-        const isMatch = normalizedManufacturer === normalizedRoom;
-
-        return (
-          <View
-            className={`p-5 rounded-2xl shadow-sm mb-3 mx-4 ${
-              isMatch
-                ? "bg-green-50 border border-green-200"
-                : "bg-white border border-gray-100"
-            } ${!isScheduleTime ? "opacity-60" : ""}`}
-          >
-            <View className="flex-row items-center">
-              <View
-                className={`p-2 rounded-full mr-3 ${isMatch ? "bg-green-100" : "bg-blue-100"}`}
-              >
-                <Ionicons
-                  name="bluetooth"
-                  size={20}
-                  color={isMatch ? "#10b981" : "#3b82f6"}
-                />
-              </View>
-              <View className="flex-1">
-                <Text className="font-semibold text-gray-800 text-base">
-                  {item.name || "Unknown Device"}
-                </Text>
-                <Text className="text-xs text-gray-500 mt-1">
-                  ID: {item.id}
-                </Text>
-                {typeof item.rssi !== "undefined" && (
-                  <Text className="text-xs text-gray-500 mt-1">
-                    RSSI: {item.rssi} dBm
-                  </Text>
-                )}
-              </View>
-              {isMatch && (
-                <View className="bg-green-100 rounded-full p-1">
-                  <Ionicons name="checkmark-circle" size={20} color="#10b981" />
-                </View>
-              )}
-            </View>
-            {manufacturer && (
-              <View className="mt-3 bg-gray-50 p-2 rounded-lg">
-                <Text
-                  className={`text-xs ${isMatch ? "text-green-600 font-medium" : "text-blue-500"}`}
-                >
-                  Manufacturer: {manufacturer}
-                  {isMatch && ` (Room Match)`}
-                </Text>
-              </View>
-            )}
-          </View>
-        );
-      },
-    [isScheduleTime, userRole, schedule, normalizedSubjectCode]
-  );
-
-  // Render different content based on active tab
+  // Instructor Student List
   if (userRole === "instructor" && activeInstructorTab === "students") {
-    // Full screen student list with back tab
     return (
       <View className="flex-1 bg-gray-50">
-        {/* Top Tabs */}
         <View className="bg-white p-4 shadow-sm">
           <View className="flex-row justify-between bg-gray-200 rounded-full p-2">
             <TouchableOpacity
-              className="flex-1 py-2 rounded-full bg-gray-200" // Always inactive in this view
+              className="flex-1 py-2 rounded-full"
               onPress={() => setActiveInstructorTab("ble")}
             >
               <Text className="text-center font-semibold text-gray-500">
                 BLE Controls
               </Text>
             </TouchableOpacity>
-            <TouchableOpacity
-              className="flex-1 py-2 rounded-full bg-white" // Always active in this view
-            >
+
+            <TouchableOpacity className="flex-1 py-2 rounded-full bg-white">
               <Text className="text-center font-semibold text-gray-700">
                 Students
               </Text>
@@ -1242,42 +1080,57 @@ const scheduleCheckRef = useRef<ReturnType<typeof setTimeout> | null>(null);
           </View>
         </View>
 
-        {/* Student List */}
         <InstructorStudentListView
           students={students}
           loading={loadingStudents}
           sessionStatus={sessionStatus}
-          onRefresh={fetchStudentsForSchedule}
+          onRefresh={fetchScheduleDetails}
           refreshing={loadingStudents}
+          activeSessionId={activeSessionId}
+          scheduleId={schedule.schedule_id}
         />
       </View>
     );
   }
 
-  // Default view with schedule details and BLE controls
+  // Main Render
   return (
     <View className="flex-1 bg-gray-50">
-      {/* Top Tabs - Only show for instructors */}
+      {/* Loading Overlays */}
+      {(isMarkingAttendance || isCreatingSession) && (
+        <View
+          style={{ backgroundColor: "rgba(0,0,0,0.6)" }}
+          className="absolute inset-0 flex-1 justify-center items-center z-50"
+        >
+          <View className="bg-white p-8 rounded-3xl items-center shadow-2xl">
+            <ActivityIndicator
+              size="large"
+              color={isCreatingSession ? "#10b981" : "#3b82f6"}
+            />
+            <Text className="text-gray-800 text-lg font-bold mt-4 text-center">
+              {isCreatingSession
+                ? "Initializing Class..."
+                : "Marking Attendance..."}
+            </Text>
+          </View>
+        </View>
+      )}
+
+      {/* Instructor Tabs */}
       {userRole === "instructor" && (
         <View className="bg-white p-4 shadow-sm">
           <View className="flex-row justify-between bg-gray-200 rounded-full p-2">
-            <TouchableOpacity
-              className={`flex-1 py-2 rounded-full ${activeInstructorTab === "ble" ? "bg-white" : "bg-gray-200"}`}
-              onPress={() => setActiveInstructorTab("ble")}
-            >
-              <Text
-                className={`text-center font-semibold ${activeInstructorTab === "ble" ? "text-gray-700" : "text-gray-500"}`}
-              >
+            <TouchableOpacity className="flex-1 py-2 rounded-full bg-white">
+              <Text className="text-center font-semibold text-gray-700">
                 BLE Controls
               </Text>
             </TouchableOpacity>
+
             <TouchableOpacity
-              className={`flex-1 py-2 rounded-full ${activeInstructorTab === "students" ? "bg-white" : "bg-gray-200"}`}
+              className="flex-1 py-2 rounded-full"
               onPress={() => setActiveInstructorTab("students")}
             >
-              <Text
-                className={`text-center font-semibold ${activeInstructorTab === "students" ? "text-gray-700" : "text-gray-500"}`}
-              >
+              <Text className="text-center font-semibold text-gray-500">
                 Students
               </Text>
             </TouchableOpacity>
@@ -1286,36 +1139,26 @@ const scheduleCheckRef = useRef<ReturnType<typeof setTimeout> | null>(null);
       )}
 
       <FlatList
-        data={
-          isScheduleTime && isBluetoothOn && !isConnected && !scanCooldown
-            ? devices
-            : []
-        }
+        data={filteredDevices}
         keyExtractor={(item) => item.id}
-        renderItem={DeviceListItem}
+        initialNumToRender={8}
+        renderItem={({ item }) => (
+          <DeviceListItem
+            item={item}
+            schedule={schedule}
+            userRole={userRole}
+            isScheduleTime={isScheduleTime}
+            isConnected={isConnected}
+            connectedDeviceId={connectedDevice?.id}
+          />
+        )}
+        // ✅ FIXED: Wrapped content in <View> to preserve navigation context
         ListHeaderComponent={
-          <>
-            {/* Schedule Details Container */}
+          <View>
             <View className="bg-white p-6 rounded-b-3xl shadow-sm mb-4">
-              <View className="flex-row items-start justify-between mb-3">
-                <View className="flex-1">
-                  <Text className="text-lg text-gray-700 mb-2">
-                    {schedule.subject_description}
-                  </Text>
-                  {userRole === "student" && schedule.instructor_name && (
-                    <Text className="text-gray-700 font-medium">
-                      Instructor: {schedule.instructor_name}
-                    </Text>
-                  )}
-                </View>
-                <View className="bg-blue-100 p-2 rounded-full">
-                  <FontAwesome5
-                    name="chalkboard-teacher"
-                    size={20}
-                    color="#3b82f6"
-                  />
-                </View>
-              </View>
+              <Text className="text-lg text-gray-700 mb-2 font-bold">
+                {schedule.subject_description}
+              </Text>
 
               <View className="flex-row items-center mb-2">
                 <Ionicons name="time-outline" size={16} color="#6b7280" />
@@ -1332,109 +1175,42 @@ const scheduleCheckRef = useRef<ReturnType<typeof setTimeout> | null>(null);
                 </Text>
               </View>
 
-              <View className="flex-row items-center">
-                <Ionicons
-                  name={
-                    schedule.schedule_type === "lecture"
-                      ? "school-outline"
-                      : schedule.schedule_type === "laboratory"
-                        ? "flask-outline"
-                        : "calendar-outline"
-                  }
-                  size={16}
-                  color="#6b7280"
-                />
-                <Text className="text-gray-600 capitalize mb-1 ml-2">
-                  {schedule.schedule_type}
-                </Text>
-              </View>
-
-              {!isScheduleTime ? (
-                <View className="mt-4 p-3 rounded-xl bg-yellow-50 border border-yellow-200 flex-row items-center">
-                  <View className="bg-yellow-100 p-2 rounded-full mr-3">
-                    <Ionicons name="time-outline" size={20} color="#d97706" />
-                  </View>
-                  <View>
-                    <Text className="text-yellow-800 font-medium">
-                      Class not in session
+              {/* ✅ NEW: Instructor Info for Students */}
+              {userRole === "student" && schedule.instructor && (
+                <View className="mt-4 pt-4 border-t border-gray-100 flex-row items-center">
+                  <Image
+                    source={
+                      schedule.instructor.image_link
+                        ? { uri: schedule.instructor.image_link }
+                        : defaultProfile
+                    }
+                    className="w-10 h-10 rounded-full bg-gray-100"
+                    resizeMode="cover"
+                  />
+                  <View className="ml-3">
+                    <Text className="text-[10px] text-gray-500 uppercase font-bold tracking-wider">
+                      Instructor
                     </Text>
-                    <Text className="text-yellow-700 text-sm mt-1">
-                      BLE features available {timeUntilSchedule}
+                    <Text className="text-gray-800 font-medium text-sm">
+                      {schedule.instructor.formatted_name ||
+                        `${schedule.instructor.lastname}, ${schedule.instructor.firstname}`}
                     </Text>
                   </View>
                 </View>
-              ) : (
-                <>
-                  <View className="mt-4 p-3 rounded-xl bg-green-50 border border-green-200 flex-row items-center">
-                    <View className="bg-green-100 p-2 rounded-full mr-3">
-                      <Ionicons
-                        name="checkmark-circle"
-                        size={20}
-                        color="#059669"
-                      />
-                    </View>
-                    <Text className="text-green-800 font-medium">
-                      Class in session - BLE features available
-                    </Text>
-                  </View>
-
-                  {sessionStatus === "active" && (
-                    <View className="mt-4 p-3 rounded-xl bg-green-50 border border-green-200 flex-row items-center">
-                      <View className="bg-green-100 p-2 rounded-full mr-3">
-                        <Ionicons
-                          name="checkmark-circle"
-                          size={20}
-                          color="#059669"
-                        />
-                      </View>
-                      <View>
-                        <Text className="text-green-800 font-medium">
-                          Active Attendance Session
-                        </Text>
-                        {userRole === "student" && autoAttendanceMarked && (
-                          <Text className="text-green-600 text-sm mt-1">
-                            ✅ Attendance automatically recorded via BLE
-                          </Text>
-                        )}
-                      </View>
-                    </View>
-                  )}
-
-                  {sessionStatus === "inactive" && userRole === "student" && (
-                    <View className="mt-4 p-3 rounded-xl bg-yellow-50 border border-yellow-200 flex-row items-center">
-                      <View className="bg-yellow-100 p-2 rounded-full mr-3">
-                        <Ionicons name="warning" size={20} color="#d97706" />
-                      </View>
-                      <Text className="text-yellow-800">
-                        No active attendance session for this subject
-                      </Text>
-                    </View>
-                  )}
-
-                  {sessionStatus === "inactive" &&
-                    userRole === "instructor" &&
-                    !isConnected && (
-                      <View className="mt-4 p-3 rounded-xl bg-yellow-50 border border-yellow-200 flex-row items-center">
-                        <View className="bg-yellow-100 p-2 rounded-full mr-3">
-                          <Ionicons name="warning" size={20} color="#d97706" />
-                        </View>
-                        <Text className="text-yellow-800">
-                          Connect to room device to start attendance session
-                        </Text>
-                      </View>
-                    )}
-                </>
               )}
             </View>
 
-            {/* Instructor BLE View */}
             {isScheduleTime && userRole === "instructor" && (
               <InstructorView
                 isConnected={isConnected}
                 connectedDevice={connectedDevice}
                 sessionStatus={sessionStatus}
                 scanning={scanning}
-                handleDisconnect={handleDisconnect}
+                handleDisconnect={() => {
+                  globalDisconnect();
+                  stopInstructorTask();
+                  setSessionStatus("inactive");
+                }}
                 onStartScan={startScanning}
                 isScheduleTime={isScheduleTime}
                 timeUntilSchedule={timeUntilSchedule}
@@ -1445,7 +1221,6 @@ const scheduleCheckRef = useRef<ReturnType<typeof setTimeout> | null>(null);
               />
             )}
 
-            {/* Student View */}
             {isScheduleTime && userRole === "student" && (
               <StudentView
                 sessionStatus={sessionStatus}
@@ -1459,53 +1234,45 @@ const scheduleCheckRef = useRef<ReturnType<typeof setTimeout> | null>(null);
                 studentBackgroundTaskRunning={studentBackgroundTaskRunning}
                 autoAttendanceMarked={autoAttendanceMarked}
                 isBluetoothOn={isBluetoothOn}
+                schedule={schedule}
+                activeSessionId={activeSessionId || undefined}
               />
             )}
 
-            {/* Schedule Time Unavailable View */}
             {!isScheduleTime && (
-              <View className="bg-white p-6 rounded-2xl shadow-sm mb-4 mx-4">
-                <View className="items-center py-6">
-                  <Ionicons name="time-outline" size={48} color="#d1d5db" />
-                  <Text className="text-gray-600 text-center mt-4 text-lg font-semibold">
-                    BLE Features Unavailable
-                  </Text>
-                  <Text className="text-gray-500 text-center mt-2">
-                    Bluetooth attendance features are only available during
-                    class hours
-                  </Text>
-                  <Text className="text-blue-600 text-center mt-2 font-medium">
-                    Available {timeUntilSchedule}
-                  </Text>
-                </View>
+              <View className="bg-white p-6 rounded-2xl shadow-sm mb-4 mx-4 items-center">
+                <Ionicons name="time-outline" size={48} color="#d1d5db" />
+                <Text className="text-gray-600 text-center mt-4 text-lg font-semibold">
+                  BLE Features Unavailable
+                </Text>
+                <Text className="text-blue-600 text-center mt-2 font-medium">
+                  Available {timeUntilSchedule}
+                </Text>
               </View>
             )}
-          </>
+          </View>
         }
         ListEmptyComponent={
-          isScheduleTime && isBluetoothOn && !isConnected && !scanCooldown ? (
-            <View className="py-8">
-              <View className="items-center">
-                <Ionicons name="bluetooth" size={48} color="#d1d5db" />
-                <Text className="text-gray-500 text-center mt-4">
-                  No devices found
-                </Text>
-                <Text className="text-gray-400 text-center mt-2">
-                  Start scanning to discover nearby BLE devices
-                </Text>
-              </View>
+          isScheduleTime &&
+          isBluetoothOn &&
+          !scanCooldown &&
+          devices.length === 0 ? (
+            <View className="py-8 items-center">
+              <Ionicons name="bluetooth" size={48} color="#d1d5db" />
+              <Text className="text-gray-500 text-center mt-4">
+                No devices found
+              </Text>
             </View>
           ) : null
         }
         refreshControl={
           <RefreshControl
-            refreshing={false}
-            onRefresh={() => {}}
+            refreshing={refreshing}
+            onRefresh={onRefresh}
             colors={["#3b82f6"]}
             tintColor="#3b82f6"
           />
         }
-        showsVerticalScrollIndicator={false}
       />
     </View>
   );

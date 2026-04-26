@@ -48,7 +48,6 @@ const GlobalConnectionIndicator: React.FC = () => {
     }
   };
 
-  // ⛔ Don’t render anything if no role
   if (!userRole) return null;
 
   // Student: hide if not active

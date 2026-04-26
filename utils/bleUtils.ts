@@ -3,6 +3,7 @@ import {
   Device,
   Subscription,
   State,
+  ScanMode,
 } from "react-native-ble-plx";
 import { Buffer } from "buffer";
 import { PermissionsAndroid, Platform } from "react-native";
@@ -17,9 +18,13 @@ export const BLE_STORAGE_KEYS = {
 
 export interface BLEScanOptions {
   filterByManufacturer?: string;
+  serviceUUIDs?: string[];
   timeout?: number;
   autoConnect?: boolean;
-  onDeviceFound?: (device: Device) => void; // Added for background scanning
+  onDeviceFound?: (device: Device) => void;
+  // Added to allow external config (from background task)
+  scanMode?: ScanMode;
+  allowDuplicates?: boolean;
 }
 
 export interface BLECallbacks {
@@ -31,7 +36,6 @@ export interface BLECallbacks {
   onScanStopped?: () => void;
 }
 
-// Interface for stored device data
 interface StoredDevice {
   id: string;
   name: string | null;
@@ -48,42 +52,53 @@ class BLEUtils {
   private rescanInterval: ReturnType<typeof setInterval> | null = null;
   private seenDevices: Set<string> = new Set();
   private backgroundDeviceCallback: ((device: Device) => void) | null = null;
+  private readonly PASSWORD = "presensure";
 
-  // ✅ Added: check Bluetooth adapter state
- async getBluetoothState(): Promise<State> {
-  return new Promise((resolve, reject) => {
-    const subscription = bleManager.onStateChange((state) => {
-      subscription.remove();
-      resolve(state);
-    }, true);
-    
-    // Fallback: get current state
-    bleManager.state()
-      .then(resolve)
-      .catch(reject);
-  });
-}
-  // Set callbacks
+  private async sendPassword(deviceId: string): Promise<boolean> {
+    try {
+      console.log(`🔐 Sending password to ${deviceId}`);
+
+      await this.writeToCharacteristic(
+        deviceId,
+        "4fafc201-1fb5-459e-8fcc-c5c9c331914b",
+        "beb5483e-36e1-4688-b7f5-ea07361b26a8",
+        this.PASSWORD
+      );
+
+      console.log("✅ Password sent successfully");
+      return true;
+    } catch (error) {
+      console.error("❌ Failed to send password:", error);
+      return false;
+    }
+  }
+
+  async getBluetoothState(): Promise<State> {
+    return new Promise((resolve, reject) => {
+      const subscription = bleManager.onStateChange((state) => {
+        subscription.remove();
+        resolve(state);
+      }, true);
+      bleManager.state().then(resolve).catch(reject);
+    });
+  }
+
   setCallbacks(callbacks: BLECallbacks): void {
     this.callbacks = callbacks;
   }
 
-  // Set background device callback for background scanning
   setBackgroundDeviceCallback(callback: (device: Device) => void): void {
     this.backgroundDeviceCallback = callback;
   }
 
-  // Clear background device callback
   clearBackgroundDeviceCallback(): void {
     this.backgroundDeviceCallback = null;
   }
 
-  // Set user role
   setUserRole(role: "instructor" | "student"): void {
     this.userRole = role;
   }
 
-  // Request Bluetooth permissions
   async requestBluetoothPermissions(): Promise<boolean> {
     if (Platform.OS !== "android") return true;
 
@@ -93,11 +108,18 @@ class BLEUtils {
           PermissionsAndroid.PERMISSIONS.BLUETOOTH_SCAN,
           PermissionsAndroid.PERMISSIONS.BLUETOOTH_CONNECT,
           PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION,
+          PermissionsAndroid.PERMISSIONS.ACCESS_COARSE_LOCATION,
         ]);
 
-        return Object.values(granted).every(
+        const allGranted = Object.values(granted).every(
           (permission) => permission === PermissionsAndroid.RESULTS.GRANTED
         );
+
+        if (!allGranted) {
+          console.warn("⚠️ All BLE/Location permissions not granted");
+          return false;
+        }
+        return allGranted;
       } else {
         const granted = await PermissionsAndroid.request(
           PermissionsAndroid.PERMISSIONS.ACCESS_FINE_LOCATION
@@ -110,7 +132,6 @@ class BLEUtils {
     }
   }
 
-  // Save connected device to storage
   async saveConnectedDevice(
     device: Device | null,
     scheduleId: number | null
@@ -142,7 +163,6 @@ class BLEUtils {
     }
   }
 
-  // Load connected device from storage
   async loadConnectedDevice(scheduleId: number): Promise<StoredDevice | null> {
     try {
       const storedDevice = await AsyncStorage.getItem(
@@ -163,7 +183,6 @@ class BLEUtils {
     }
   }
 
-  // Check if device is still connected
   async checkDeviceConnection(deviceId: string): Promise<boolean> {
     try {
       const connected = await bleManager.isDeviceConnected(deviceId);
@@ -174,14 +193,12 @@ class BLEUtils {
     }
   }
 
-  // Check if text contains room patterns
   isRoomPattern(text: string): boolean {
     return (
       text.includes("ComLab") || text.includes("Lab") || text.includes("Room")
     );
   }
 
-  // Simple base64 decoding function
   decodeBase64ManufacturerData(manufacturerData: string): string {
     try {
       let data = manufacturerData;
@@ -197,7 +214,6 @@ class BLEUtils {
     }
   }
 
-  // Decode manufacturer data (with fallbacks)
   decodeManufacturerData(manufacturerData?: string | null): string {
     if (!manufacturerData) return "";
     try {
@@ -210,13 +226,16 @@ class BLEUtils {
     }
   }
 
-  // Start device scan
   async startDeviceScan(options: BLEScanOptions = {}): Promise<void> {
     const {
       filterByManufacturer,
+      serviceUUIDs,
       timeout = 20000,
       autoConnect = true,
-      onDeviceFound, // For background scanning
+      onDeviceFound,
+      // ✅ Allow external override for background task
+      scanMode = ScanMode.LowLatency, 
+      allowDuplicates = true
     } = options;
 
     const hasPermission = await this.requestBluetoothPermissions();
@@ -224,7 +243,7 @@ class BLEUtils {
       throw new Error("Bluetooth permissions are required.");
     }
 
-    if (!filterByManufacturer || filterByManufacturer.trim() === "") {
+    if ((!filterByManufacturer || filterByManufacturer.trim() === "") && (!serviceUUIDs || serviceUUIDs.length === 0)) {
       console.warn("⚠️ No filter provided, skipping scan.");
       return;
     }
@@ -233,59 +252,64 @@ class BLEUtils {
     this.seenDevices.clear();
     this.callbacks.onScanStarted?.();
 
-    const filters = filterByManufacturer.split("|").map((f) => f.trim());
+    const filters = filterByManufacturer ? filterByManufacturer.split("|").map((f) => f.trim()) : [];
 
-    bleManager.startDeviceScan(null, null, (error, device) => {
-      if (error) {
-        this.stopDeviceScan();
-        this.callbacks.onError?.(error);
-        return;
-      }
+    bleManager.startDeviceScan(
+      serviceUUIDs ?? null, 
+      {
+        scanMode: scanMode,
+        allowDuplicates: allowDuplicates,
+      },
+      (error, device) => {
+        if (error) {
+          if (error.errorCode === 600 || error.message?.includes("cancelled")) {
+            return;
+          }
 
-      if (device) {
-        if (this.seenDevices.has(device.id)) return;
-        this.seenDevices.add(device.id);
-
-        // Call both regular callback and background callback
-        this.callbacks.onDeviceFound?.(device);
-        if (onDeviceFound) {
-          onDeviceFound(device);
-        }
-        if (this.backgroundDeviceCallback) {
-          this.backgroundDeviceCallback(device);
+          this.stopDeviceScan();
+          this.callbacks.onError?.(error);
+          return;
         }
 
-        if (autoConnect) {
-          const manufacturer = this.decodeManufacturerData(
-            device.manufacturerData
-          );
-          if (manufacturer && filters.some((f) => manufacturer === f)) {
-            this.checkDeviceConnection(device.id).then((isConnected) => {
-              if (!isConnected) {
-                this.connectToDevice(device).catch((err) => {
-                  console.error("Auto-connect failed:", err);
-                });
-              } else {
-                this.callbacks.onDeviceConnected?.(device);
-              }
-            });
+        if (device) {
+          if (this.seenDevices.has(device.id)) return;
+          this.seenDevices.add(device.id);
+
+          this.callbacks.onDeviceFound?.(device);
+          if (onDeviceFound) {
+            onDeviceFound(device);
+          }
+          if (this.backgroundDeviceCallback) {
+            this.backgroundDeviceCallback(device);
+          }
+
+          if (autoConnect) {
+            const manufacturer = this.decodeManufacturerData(
+              device.manufacturerData
+            );
+            if (manufacturer && filters.some((f) => manufacturer === f)) {
+              this.checkDeviceConnection(device.id).then((isConnected) => {
+                if (!isConnected) {
+                  this.connectToDevice(device).catch((err) => {
+                      if (err.errorCode !== 600) {
+                        console.error("Auto-connect failed:", err);
+                      }
+                  });
+                } else {
+                  this.callbacks.onDeviceConnected?.(device);
+                }
+              });
+            }
           }
         }
       }
-    });
+    );
 
     if (timeout > 0) {
       if (this.scanTimeout) clearTimeout(this.scanTimeout);
       this.scanTimeout = setTimeout(() => {
         this.stopDeviceScan();
       }, timeout);
-
-      if (this.rescanInterval) clearInterval(this.rescanInterval);
-      this.rescanInterval = setInterval(() => {
-        if (!this.isScanning) return;
-        this.stopDeviceScan();
-        this.startDeviceScan(options);
-      }, timeout * 2);
     }
   }
 
@@ -309,7 +333,6 @@ class BLEUtils {
     this.seenDevices.clear();
   }
 
-  // Connect to device
   async connectToDevice(device: Device): Promise<Device> {
     try {
       const isAlreadyConnected = await this.checkDeviceConnection(device.id);
@@ -324,6 +347,17 @@ class BLEUtils {
       });
 
       await connected.discoverAllServicesAndCharacteristics();
+
+      const passwordSent = await this.sendPassword(device.id);
+      if (!passwordSent) {
+        await this.disconnectDevice(device.id);
+        throw new Error("Password authentication failed");
+      }
+
+      await new Promise<void>((resolve) => {
+        setTimeout(() => resolve(), 500);
+      });
+
       this.connectedDevice = connected;
       this.callbacks.onDeviceConnected?.(connected);
 
@@ -337,6 +371,10 @@ class BLEUtils {
       this.stopDeviceScan();
       return connected;
     } catch (error: any) {
+      if (error.errorCode === 600 || error.message?.includes("cancelled")) {
+         return device; 
+      }
+
       if (error.message?.includes("already connected")) {
         this.connectedDevice = device;
         this.callbacks.onDeviceConnected?.(device);
@@ -347,7 +385,6 @@ class BLEUtils {
     }
   }
 
-  // Write data to a characteristic
   async writeToCharacteristic(
     deviceId: string,
     serviceUUID: string,
@@ -378,7 +415,6 @@ class BLEUtils {
     }
   }
 
-  // Disconnect device
   async disconnectDevice(deviceId: string): Promise<void> {
     try {
       await bleManager.cancelDeviceConnection(deviceId);
@@ -394,7 +430,6 @@ class BLEUtils {
     }
   }
 
-  // Clean up resources
   destroy(): void {
     this.stopDeviceScan();
     this.connectionSubscriptions.forEach((subscription) =>

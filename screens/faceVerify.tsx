@@ -6,21 +6,31 @@ import {
   useWindowDimensions,
   Alert,
   ActivityIndicator,
+  StatusBar,
+  Platform,
+  TouchableOpacity,
+  AppState,
+  AppStateStatus,
 } from "react-native";
 import {
   Camera as VisionCamera,
   useCameraDevice,
   useCameraPermission,
-  PhotoFile,
 } from "react-native-vision-camera";
 import {
   Camera,
   Face,
-  FaceDetectionOptions,
 } from "react-native-vision-camera-face-detector";
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import { useNavigation } from "@react-navigation/native";
+import { useNavigation, useIsFocused } from "@react-navigation/native";
 import { Svg, Circle } from "react-native-svg";
+import { FACE_API } from "../api/apiConfig";
+
+// --- CONFIGURATION ---
+const THEME_COLOR = "#2F80ED"; 
+const MAX_ATTEMPTS = 3;
+const CHALLENGE_TIMEOUT = 5000;
+const CAPTURE_COUNTDOWN = 3;
 
 type ChallengeType =
   | "turn_left"
@@ -31,247 +41,263 @@ type ChallengeType =
   | "look_down";
 
 export default function FaceVerify({ route }: any) {
-  const navigation = useNavigation();
-  const { schedule, onVerificationSuccess } = route.params || {};
+  const navigation = useNavigation<any>();
+  const isFocused = useIsFocused();
+  const { onVerificationSuccess } = route.params || {};
   const { hasPermission, requestPermission } = useCameraPermission();
   const { width, height } = useWindowDimensions();
   const device = useCameraDevice("front");
   const cameraRef = useRef<VisionCamera>(null);
 
+  // --- STATE ---
+  const [appState, setAppState] = useState<AppStateStatus>(AppState.currentState);
+  const [isCameraInitialized, setIsCameraInitialized] = useState(false);
+  
   const [currentChallenge, setCurrentChallenge] = useState<ChallengeType | "none">("none");
   const [completedChallenges, setCompletedChallenges] = useState<ChallengeType[]>([]);
   const [isProcessing, setIsProcessing] = useState(false);
   const [verificationAttempts, setVerificationAttempts] = useState(0);
   const [isCameraActive, setIsCameraActive] = useState(true);
   const [blinkCount, setBlinkCount] = useState(0);
+  const [captureTimer, setCaptureTimer] = useState(3);
+  const [isCapturing, setIsCapturing] = useState(false);
+  const [requiredChallenges, setRequiredChallenges] = useState(0);
 
-  const maxAttempts = 3;
-  const requiredChallenges = 3;
-  const challengeTimeout = 5000; // 5 seconds
-
-  const timerRef = useRef<NodeJS.Timeout | null>(null);
+  // --- REFS ---
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const captureTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const lastEyeStateRef = useRef<"open" | "closed">("open");
   const isVerificationActive = useRef(false);
   const availableChallengesRef = useRef<ChallengeType[]>([]);
   const challengeCompletedRef = useRef(false);
   const attemptsRef = useRef(0);
   const lastDetectionRef = useRef(0);
+  const completedChallengesRef = useRef<ChallengeType[]>([]);
+  const requiredChallengesRef = useRef(0);
 
-  const challenges: { type: ChallengeType; instruction: string }[] = [
-    { type: "turn_left", instruction: "Turn head LEFT" },
-    { type: "turn_right", instruction: "Turn head RIGHT" },
-    { type: "smile", instruction: "SMILE" },
-    { type: "blink", instruction: "BLINK 2 times" },
-    { type: "look_up", instruction: "Look UP" },
-    { type: "look_down", instruction: "Look DOWN" },
+  const isCameraActiveProps = 
+    isCameraActive && 
+    isFocused && 
+    appState === "active" && 
+    isCameraInitialized;
+
+  // ✅ UPDATED: Added icon property for arrows
+  const challenges: { type: ChallengeType; instruction: string; icon: string }[] = [
+    { type: "turn_left", instruction: "Turn Head Left", icon: "⬅️" },
+    { type: "turn_right", instruction: "Turn Head Right", icon: "➡️" },
+    { type: "smile", instruction: "Smile", icon: "🙂" },
+    { type: "blink", instruction: "Blink Eyes", icon: "👁️" },
+    { type: "look_up", instruction: "Look Up", icon: "⬆️" },
+    { type: "look_down", instruction: "Look Down", icon: "⬇️" },
   ];
 
-  // Request camera permission on mount
+  // --- INITIALIZATION ---
+  
+  useEffect(() => {
+    const subscription = AppState.addEventListener("change", (nextAppState) => {
+      setAppState(nextAppState);
+    });
+    return () => {
+      subscription.remove();
+    };
+  }, []);
+
   useEffect(() => {
     const initCamera = async () => {
       if (!hasPermission) {
+        setIsCameraInitialized(false);
         await requestPermission();
+      } else {
+        const timeout = setTimeout(() => {
+          setIsCameraInitialized(true);
+        }, 500);
+        return () => clearTimeout(timeout);
       }
     };
     initCamera();
   }, [hasPermission, requestPermission]);
 
-  // Initialize challenges when camera is ready
-  useEffect(() => {
-    if (hasPermission && device) {
-      availableChallengesRef.current = [...challenges.map((c) => c.type)];
-      startNewChallenge();
-    }
-  }, [hasPermission, device]);
-
-  // Sync ref with state
-  useEffect(() => {
-    attemptsRef.current = verificationAttempts;
-  }, [verificationAttempts]);
-
-  // Cleanup on unmount
   useEffect(() => {
     return () => {
-      if (timerRef.current) {
-        clearTimeout(timerRef.current);
-      }
+      stopTimers();
       setIsCameraActive(false);
     };
   }, []);
 
-  const startNewChallenge = () => {    
-    if (attemptsRef.current >= maxAttempts) {
+  useEffect(() => {
+    if (hasPermission && device && isCameraInitialized) {
+        initializeChallenges();
+    }
+  }, [hasPermission, device, isCameraInitialized]);
+
+  useEffect(() => {
+    attemptsRef.current = verificationAttempts;
+    completedChallengesRef.current = completedChallenges;
+    requiredChallengesRef.current = requiredChallenges;
+  }, [verificationAttempts, completedChallenges, requiredChallenges]);
+
+  const stopTimers = () => {
+    if (timerRef.current) clearTimeout(timerRef.current);
+    if (captureTimerRef.current) clearInterval(captureTimerRef.current);
+  };
+
+  // --- LOGIC ---
+  const initializeChallenges = () => {
+    const randomRequired = Math.floor(Math.random() * 2) + 2; 
+    setRequiredChallenges(randomRequired);
+    requiredChallengesRef.current = randomRequired;
+
+    availableChallengesRef.current = challenges.map((c) => c.type);
+    completedChallengesRef.current = [];
+    setCompletedChallenges([]);
+    startNewChallenge();
+  };
+
+  const startNewChallenge = () => {
+    if (attemptsRef.current >= MAX_ATTEMPTS) {
       handleMaxAttemptsReached();
       return;
     }
 
-    if (completedChallenges.length >= requiredChallenges) {
+    if (completedChallengesRef.current.length >= requiredChallengesRef.current) {
       setCurrentChallenge("none");
-      handleVerificationComplete();
+      startCaptureCountdown();
       return;
     }
 
     if (availableChallengesRef.current.length === 0) {
-      availableChallengesRef.current = [...challenges.map((c) => c.type)];
+      availableChallengesRef.current = challenges.map((c) => c.type);
     }
 
     const randomIndex = Math.floor(Math.random() * availableChallengesRef.current.length);
-    const selectedChallengeType = availableChallengesRef.current[randomIndex];
-    
-    setCurrentChallenge(selectedChallengeType);
+    const selected = availableChallengesRef.current[randomIndex];
+
+    setCurrentChallenge(selected);
     setBlinkCount(0);
     lastEyeStateRef.current = "open";
     challengeCompletedRef.current = false;
 
-    // Clear existing timer
-    if (timerRef.current) {
-      clearTimeout(timerRef.current);
-    }
-
-    // Set timeout for challenge
-    timerRef.current = setTimeout(() => {
-      handleChallengeFailed();
-    }, challengeTimeout);
+    if (timerRef.current) clearTimeout(timerRef.current);
+    timerRef.current = setTimeout(handleChallengeFailed, CHALLENGE_TIMEOUT);
   };
 
-  const handleChallengeFailed = () => {
-    if (timerRef.current) {
-      clearTimeout(timerRef.current);
-    }
-    resetChallenges();
-  };
+  const startCaptureCountdown = () => {
+    setIsCapturing(true);
+    setCaptureTimer(CAPTURE_COUNTDOWN);
+    if (captureTimerRef.current) clearInterval(captureTimerRef.current);
 
-  const handleChallengeSuccess = () => {
-    if (challengeCompletedRef.current || currentChallenge === "none") {
-      return;
-    }
-
-    challengeCompletedRef.current = true;
-
-    if (timerRef.current) {
-      clearTimeout(timerRef.current);
-    }
-
-    // Remove completed challenge from available ones
-    availableChallengesRef.current = availableChallengesRef.current.filter(
-      (type) => type !== currentChallenge
-    );
-
-    setCompletedChallenges((prevCompleted) => {
-      const newCompleted = [...prevCompleted, currentChallenge];
-      
-      // Start next challenge after a short delay
-      setTimeout(() => {
-        startNewChallenge();
-      }, 1000);
-      
-      return newCompleted;
-    });
-  };
-
-  const resetChallenges = () => {
-    setCompletedChallenges([]);
-    setCurrentChallenge("none");
-    availableChallengesRef.current = [...challenges.map((c) => c.type)];
-    
-    setTimeout(() => {
-      startNewChallenge();
+    captureTimerRef.current = setInterval(() => {
+      setCaptureTimer((prev) => {
+        if (prev <= 1) {
+          if (captureTimerRef.current) clearInterval(captureTimerRef.current);
+          setIsCapturing(false);
+          handleVerificationComplete();
+          return 0;
+        }
+        return prev - 1;
+      });
     }, 1000);
   };
 
+  const handleChallengeFailed = () => {
+    stopTimers();
+    Alert.alert("Time's Up", "Please react faster.", [
+        { text: "Try Again", onPress: () => resetChallenges() }
+    ]);
+  };
+
+  const handleChallengeSuccess = () => {
+    if (challengeCompletedRef.current || currentChallenge === "none") return;
+
+    challengeCompletedRef.current = true;
+    if (timerRef.current) clearTimeout(timerRef.current);
+
+    availableChallengesRef.current = availableChallengesRef.current.filter(
+      (t) => t !== currentChallenge
+    );
+
+    const newCompleted = [...completedChallengesRef.current, currentChallenge];
+    completedChallengesRef.current = newCompleted;
+    setCompletedChallenges(newCompleted);
+
+    setTimeout(startNewChallenge, 800);
+  };
+
+  const resetChallenges = () => {
+    stopTimers();
+    setIsCapturing(false);
+    setCaptureTimer(CAPTURE_COUNTDOWN);
+    setCompletedChallenges([]);
+    completedChallengesRef.current = [];
+    setCurrentChallenge("none");
+    setTimeout(initializeChallenges, 1000);
+  };
+
+  // --- FACE DETECTION ---
   const checkChallenge = (face: Face) => {
-    if (currentChallenge === "none" || isProcessing || challengeCompletedRef.current) {
-      return;
-    }
+    if (currentChallenge === "none" || isProcessing || challengeCompletedRef.current) return;
+
     switch (currentChallenge) {
       case "turn_left":
-        if (face.yawAngle > 20) {
-          handleChallengeSuccess();
-        }
+        if (face.yawAngle > 20) handleChallengeSuccess();
         break;
       case "turn_right":
-        if (face.yawAngle < -20) {
-          handleChallengeSuccess();
-        }
+        if (face.yawAngle < -20) handleChallengeSuccess();
         break;
       case "smile":
-        if (face.smilingProbability !== undefined && face.smilingProbability > 0.8) {
-          handleChallengeSuccess();
-        }
+        if (face.smilingProbability && face.smilingProbability > 0.8) handleChallengeSuccess();
         break;
       case "blink":
-        const leftEyeClosed = face.leftEyeOpenProbability < 0.3;
-        const rightEyeClosed = face.rightEyeOpenProbability < 0.3;
-        const bothEyesClosed = leftEyeClosed && rightEyeClosed;
-        const bothEyesOpen = face.leftEyeOpenProbability > 0.7 && face.rightEyeOpenProbability > 0.7;
-
-        if (bothEyesClosed && lastEyeStateRef.current === "open") {
-          const newBlinkCount = blinkCount + 1;
-          setBlinkCount(newBlinkCount);
-          
-          if (newBlinkCount >= 2) {
-            handleChallengeSuccess();
-          }
+        const leftClosed = face.leftEyeOpenProbability < 0.3;
+        const rightClosed = face.rightEyeOpenProbability < 0.3;
+        const bothOpen = face.leftEyeOpenProbability > 0.7 && face.rightEyeOpenProbability > 0.7;
+        
+        if (leftClosed && rightClosed && lastEyeStateRef.current === "open") {
+          const newCount = blinkCount + 1;
+          setBlinkCount(newCount);
+          if (newCount >= 2) handleChallengeSuccess();
         }
-
-        lastEyeStateRef.current = bothEyesOpen ? "open" : "closed";
+        lastEyeStateRef.current = bothOpen ? "open" : "closed";
         break;
       case "look_up":
-        if (face.pitchAngle > 20) {
-          handleChallengeSuccess();
-        }
+        if (face.pitchAngle > 20) handleChallengeSuccess();
         break;
       case "look_down":
-        if (face.pitchAngle < -15) {
-          handleChallengeSuccess();
-        }
+        if (face.pitchAngle < -15) handleChallengeSuccess();
         break;
     }
   };
 
   const handleFacesDetection = (faces: Face[]) => {
     const now = Date.now();
-    // Reduce throttling to allow more frequent detection
     if (now - lastDetectionRef.current < 200) return;
     lastDetectionRef.current = now;
 
     if (faces.length > 0 && !isProcessing && currentChallenge !== "none") {
       checkChallenge(faces[0]);
-    } else if (faces.length === 0) {
     }
   };
 
+  // --- API / CAPTURE ---
   const captureImage = async (): Promise<string | null> => {
     try {
-      if (!cameraRef.current) {
-        return null;
-      }
-      
-      const photo: PhotoFile = await cameraRef.current.takePhoto({
-        flash: 'off',
+      if (!cameraRef.current) return null;
+      const photo = await cameraRef.current.takePhoto({
+        flash: "off",
         enableShutterSound: false,
       });
-      
       return `file://${photo.path}`;
     } catch (error) {
-      console.error("Error capturing image:", error);
       return null;
     }
   };
 
   const verifyFaces = async (capturedImage: string): Promise<boolean> => {
     try {
-      
       const userData = await AsyncStorage.getItem("user");
-      if (!userData) {
-        throw new Error("User data not found");
-      }
-
+      if (!userData) throw new Error("No user data");
       const user = JSON.parse(userData);
-      if (!user.image_link) {
-        throw new Error("Reference image not found");
-      }
-
+      
       const response = await fetch(capturedImage);
       const blob = await response.blob();
 
@@ -279,168 +305,164 @@ export default function FaceVerify({ route }: any) {
         const reader = new FileReader();
         reader.onloadend = async () => {
           try {
-            const base64data = reader.result as string;
-            const payload = {
-              reference_image: user.image_link,
-              captured_image: base64data.split(',')[1], // Remove data URL prefix
-            };
-            
-            const apiResponse = await fetch("http://192.168.1.15:5000/python/verify", {
+            const base64 = (reader.result as string).split(",")[1];
+            const res = await fetch(`${FACE_API}/verify`, {
               method: "POST",
               headers: { "Content-Type": "application/json" },
-              body: JSON.stringify(payload),
+              body: JSON.stringify({
+                reference_image: user.image_link,
+                captured_image: base64,
+              }),
             });
-
-            if (!apiResponse.ok) {
-              resolve(false);
-              return;
-            }
-
-            const result = await apiResponse.json();
-            
-            resolve(result.success && result.result?.verified);
-          } catch (error) {
-            console.error("Error in verification:", error);
+            const json = await res.json();
+            resolve(json.success && json.result?.verified);
+          } catch (e) {
             resolve(false);
           }
         };
         reader.readAsDataURL(blob);
       });
-    } catch (error) {
-      console.error("Error in verifyFaces:", error);
+    } catch (e) {
       return false;
     }
   };
 
   const handleVerificationComplete = async () => {
-    if (isVerificationActive.current || attemptsRef.current >= maxAttempts) {
-      return;
+    if (attemptsRef.current >= MAX_ATTEMPTS) {
+        handleMaxAttemptsReached();
+        return;
     }
-
+    
+    if (isVerificationActive.current) return;
+    
     isVerificationActive.current = true;
     setIsProcessing(true);
 
     try {
-      const capturedImage = await captureImage();
+      const img = await captureImage();
+      
+      if (img) {
+        const isVerified = await verifyFaces(img);
+        
+        const newAttempts = attemptsRef.current + 1;
+        setVerificationAttempts(newAttempts);
 
-      if (capturedImage) {
-        const isVerified = await verifyFaces(capturedImage);
-        setVerificationAttempts((prevAttempts) => {
-          const newAttempts = prevAttempts + 1;
-
-          if (isVerified) {
-            if (onVerificationSuccess) {
-              onVerificationSuccess(true);
-            }
-            Alert.alert("Success", "Face verification successful!", [
-              {
-                text: "OK",
-                onPress: () => navigation.goBack()
-              },
-            ]);
-          } else if (newAttempts >= maxAttempts) {
-            handleMaxAttemptsReached();
+        if (isVerified) {
+          if (onVerificationSuccess) await onVerificationSuccess(true);
+          Alert.alert("Success", "Identity Verified");
+          setTimeout(() => navigation.goBack(), 1000);
+        } else {
+          if (newAttempts >= MAX_ATTEMPTS) {
+             handleMaxAttemptsReached();
           } else {
-            Alert.alert("Failed", `Attempt ${newAttempts}/${maxAttempts}. Please try again.`);
-            resetChallenges();
+             Alert.alert("Failed", `Face did not match. Attempt ${newAttempts}/${MAX_ATTEMPTS}`);
+             
+             setIsProcessing(false);
+             isVerificationActive.current = false;
+             startCaptureCountdown();
           }
-          return newAttempts;
-        });
+        }
       } else {
-        handleVerificationError();
+        throw new Error("Capture failed");
       }
-    } catch (error) {
+    } catch (e) {
       handleVerificationError();
     } finally {
-      setIsProcessing(false);
-      isVerificationActive.current = false;
-      setIsCameraActive(true);
+        if (attemptsRef.current < MAX_ATTEMPTS && !isVerificationActive.current) {
+             setIsProcessing(false);
+        }
     }
   };
 
   const handleVerificationError = () => {
-    setVerificationAttempts((prevAttempts) => {
-      const newAttempts = prevAttempts + 1;
-
-      if (newAttempts >= maxAttempts) {
-        handleMaxAttemptsReached();
-      } else {
-        Alert.alert("Error", `Attempt ${newAttempts}/${maxAttempts}. Please try again.`);
-        resetChallenges();
-      }
-      return newAttempts;
-    });
+    const newAttempts = attemptsRef.current + 1;
+    setVerificationAttempts(newAttempts);
+    
+    if (newAttempts >= MAX_ATTEMPTS) {
+      handleMaxAttemptsReached();
+    } else {
+      Alert.alert("Error", "Camera error. Retrying...");
+      setIsProcessing(false);
+      isVerificationActive.current = false;
+      startCaptureCountdown();
+    }
   };
 
   const handleMaxAttemptsReached = () => {
-    if (onVerificationSuccess) {
-      onVerificationSuccess(false);
-    }
-    Alert.alert("Maximum Attempts", "Verification failed after 3 attempts.", [
-      {
-        text: "OK",
-        onPress: () => navigation.goBack()
-      },
-    ]);
+    setIsCameraActive(false); 
+    setIsProcessing(false);
+    isVerificationActive.current = false;
+
+    if (onVerificationSuccess) onVerificationSuccess(false);
+    
+    setTimeout(() => {
+        Alert.alert("Verification Failed", "Maximum attempts reached.", [
+          {
+            text: "Back to Schedule",
+            onPress: () => {
+                if (navigation.canGoBack()) {
+                    navigation.goBack();
+                } else {
+                    navigation.navigate("ViewSchedule");
+                }
+            },
+          },
+        ]);
+    }, 500);
   };
 
-  const getChallengeIcon = (type: ChallengeType) => {
-    const icons = {
-      turn_left: "👈",
-      turn_right: "👉",
-      smile: "😊",
-      blink: "😉",
-      look_up: "👆",
-      look_down: "👇",
-    };
-    return icons[type];
-  };
-
-  if (verificationAttempts >= maxAttempts) {
+  // --- RENDER ---
+  if (!device || !hasPermission || !isCameraInitialized) {
+    return <View style={styles.loadingContainer}><ActivityIndicator color={THEME_COLOR} /></View>;
+  }
+  
+  if (verificationAttempts >= MAX_ATTEMPTS) {
     return (
-      <View style={styles.centerContainer}>
-        <Text style={styles.message}>Maximum attempts reached</Text>
+      <View style={styles.loadingContainer}>
+          <Text style={{ fontSize: 22, color: '#333', marginBottom: 20, fontWeight: 'bold' }}>
+             Maximum Attempts Reached
+          </Text>
+          <Text style={{ marginBottom: 20, color: '#666' }}>
+            Please contact support or try again later.
+          </Text>
+          <TouchableOpacity 
+             onPress={() => {
+                 navigation.navigate("ViewSchedule");
+             }}
+             style={{ 
+               backgroundColor: THEME_COLOR, 
+               paddingVertical: 12, 
+               paddingHorizontal: 24, 
+               borderRadius: 25 
+             }}
+          >
+             <Text style={{ color: '#FFF', fontSize: 16, fontWeight: '600' }}>Return to Schedule</Text>
+          </TouchableOpacity>
       </View>
     );
   }
 
-  if (!hasPermission) {
-    return (
-      <View style={styles.centerContainer}>
-        <Text style={styles.message}>Camera permission required</Text>
-      </View>
-    );
-  }
-
-  if (!device) {
-    return (
-      <View style={styles.centerContainer}>
-        <Text style={styles.message}>Front camera not available</Text>
-      </View>
-    );
-  }
-
-  const progress = (completedChallenges.length / requiredChallenges) * 100;
-  const currentChallengeData = challenges.find((c) => c.type === currentChallenge);
-
-  // Circular progress bar calculations
-  const OVAL_WIDTH = 320;
-  const OVAL_HEIGHT = 400;
-  const ovalCenterX = (width - OVAL_WIDTH) / 2;
-  const ovalCenterY = (height - OVAL_HEIGHT) / 2;
-
-  const radius = 160;
+  const currentData = challenges.find((c) => c.type === currentChallenge);
+  const OVAL_W = width * 0.85;
+  const OVAL_H = height * 0.55;
+  const centerX = (width - OVAL_W) / 2;
+  const centerY = (height - OVAL_H) / 2; // Centered exactly
+  const radius = OVAL_W / 2;
   const circumference = 2 * Math.PI * radius;
+  const progress = requiredChallenges > 0 ? (completedChallenges.length / requiredChallenges) * 100 : 0;
   const strokeDashoffset = circumference - (progress / 100) * circumference;
 
   return (
     <View style={styles.container}>
+      <StatusBar barStyle="light-content" backgroundColor="#000" />
+      
       {isCameraActive && (
         <Camera
+          key={device.id} 
           ref={cameraRef}
           style={StyleSheet.absoluteFill}
           device={device}
-          isActive={isCameraActive}
+          isActive={isCameraActiveProps} 
           photo={true}
           faceDetectionCallback={handleFacesDetection}
           faceDetectionOptions={{
@@ -452,107 +474,73 @@ export default function FaceVerify({ route }: any) {
       )}
 
       <View style={styles.overlay}>
-        {/* Clear inner area - Cutout */}
-        <View
-          style={[
-            styles.clearArea,
-            {
-              width: OVAL_WIDTH - 16,
-              height: OVAL_HEIGHT - 16,
-              left: ovalCenterX + 8,
-              top: ovalCenterY + 8,
-              borderRadius: (OVAL_HEIGHT - 16) / 2,
-            },
-          ]}
-        />
-
-        {/* Circular Progress Bar */}
-        <View
-          style={[
-            styles.circularProgressContainer,
-            {
-              left: ovalCenterX,
-              top: ovalCenterY,
-              width: OVAL_WIDTH,
-              height: OVAL_HEIGHT,
-            },
-          ]}
-        >
-          <Svg width={OVAL_WIDTH} height={OVAL_HEIGHT}>
-            <Circle
-              cx={OVAL_WIDTH / 2}
-              cy={OVAL_HEIGHT / 2}
-              r={radius}
-              stroke="#FFFFFF"
-              strokeWidth={8}
-              fill="transparent"
-            />
-            <Circle
-              cx={OVAL_WIDTH / 2}
-              cy={OVAL_HEIGHT / 2}
-              r={radius}
-              stroke="#10B981"
-              strokeWidth={8}
-              fill="transparent"
-              strokeDasharray={circumference}
-              strokeDashoffset={strokeDashoffset}
-              strokeLinecap="round"
-              transform={`rotate(-90 ${OVAL_WIDTH / 2} ${OVAL_HEIGHT / 2})`}
-            />
-          </Svg>
+        {/* ✅ CHANGED: Header now shows the Challenge Instruction */}
+        <View style={styles.topSection}>
+            {!isProcessing && !isCapturing && currentData ? (
+                <View style={styles.challengeContainer}>
+                     {/* Directions Icons */}
+                    <Text style={styles.directionIcon}>{currentData.icon}</Text>
+                    <Text style={styles.challengeText}>{currentData.instruction}</Text>
+                    {currentChallenge === "blink" && (
+                        <Text style={styles.subText}>Blinks: {blinkCount}/2</Text>
+                    )}
+                </View>
+            ) : isProcessing ? (
+                <View style={styles.processingBadge}>
+                     <ActivityIndicator size="small" color="#FFF" />
+                     <Text style={styles.processingText}>Verifying...</Text>
+                </View>
+            ) : null}
         </View>
 
-        {/* Challenge Instruction */}
-        {!isProcessing && currentChallengeData && (
-          <View style={styles.challengeInstruction}>
-            <Text style={styles.challengeIcon}>
-              {getChallengeIcon(currentChallengeData.type)}
-            </Text>
-            <Text style={styles.challengeText}>
-              {currentChallengeData.instruction}
-            </Text>
-            {currentChallenge === "blink" && (
-              <Text style={styles.blinkCount}>
-                Blinks: {blinkCount}/2
-              </Text>
+        <View style={[styles.cutoutContainer, { top: centerY, left: centerX, width: OVAL_W, height: OVAL_H }]}>
+            <View style={[styles.bracket, styles.bracketTL]} />
+            <View style={[styles.bracket, styles.bracketTR]} />
+            <View style={[styles.bracket, styles.bracketBL]} />
+            <View style={[styles.bracket, styles.bracketBR]} />
+
+            <View style={styles.progressRing}>
+                <Svg width={OVAL_W} height={OVAL_W}>
+                    <Circle
+                        cx={OVAL_W / 2}
+                        cy={OVAL_W / 2}
+                        r={radius - 5}
+                        stroke="rgba(255,255,255,0.2)"
+                        strokeWidth={4}
+                        fill="transparent"
+                    />
+                    <Circle
+                        cx={OVAL_W / 2}
+                        cy={OVAL_W / 2}
+                        r={radius - 5}
+                        stroke={THEME_COLOR}
+                        strokeWidth={6}
+                        fill="transparent"
+                        strokeDasharray={circumference}
+                        strokeDashoffset={strokeDashoffset}
+                        strokeLinecap="round"
+                        transform={`rotate(-90 ${OVAL_W / 2} ${OVAL_W / 2})`}
+                    />
+                </Svg>
+            </View>
+
+            {isCapturing && (
+                <View style={styles.centerContent}>
+                    <Text style={styles.countdownText}>{captureTimer}</Text>
+                    <Text style={styles.statusText}>Hold Still</Text>
+                </View>
             )}
-          </View>
-        )}
-
-        {/* Processing Text */}
-        {isProcessing && (
-          <View style={styles.processingContainer}>
-            <Text style={styles.processingText}>Verifying...</Text>
-          </View>
-        )}
-
-        {/* Attempts Counter */}
-        <View style={styles.attemptsContainer}>
-          <Text style={styles.attemptsText}>
-            Attempt {verificationAttempts + 1}/{maxAttempts}
-          </Text>
         </View>
 
-        {/* Debug Info */}
-        <View style={styles.debugContainer}>
-          <Text style={styles.debugText}>
-            Challenges: {completedChallenges.length}/{requiredChallenges}
-          </Text>
+        {/* ✅ CHANGED: Footer now shows the Attempts Info */}
+        <View style={styles.bottomSection}>
+            <Text style={styles.footerTitle}>Face Verification</Text>
+            <Text style={styles.footerSubtitle}>
+                Attempt {verificationAttempts + 1} of {MAX_ATTEMPTS}
+            </Text>
         </View>
+
       </View>
-
-      {isProcessing && (
-        <View style={styles.fullScreenOverlay}>
-          <View style={styles.loaderContainer}>
-            <ActivityIndicator
-              size="large"
-              color="#10B981"
-              style={{ marginBottom: 12 }}
-            />
-            <Text style={styles.loaderText}>Verifying Face...</Text>
-          </View>
-        </View>
-      )}
     </View>
   );
 }
@@ -562,120 +550,131 @@ const styles = StyleSheet.create({
     flex: 1,
     backgroundColor: "#000",
   },
-  centerContainer: {
+  loadingContainer: {
     flex: 1,
+    backgroundColor: "#fff",
     justifyContent: "center",
     alignItems: "center",
-    backgroundColor: "#fff",
-  },
-  message: {
-    fontSize: 18,
-    textAlign: "center",
-    color: "#333",
+    padding: 20,
   },
   overlay: {
     ...StyleSheet.absoluteFillObject,
-    backgroundColor: "rgba(0,0,0,0.6)",
-  },
-  clearArea: {
-    position: "absolute",
     backgroundColor: "transparent",
+    justifyContent: "space-between", // Pushes Top and Bottom sections apart
+    paddingVertical: 40,
   },
-  circularProgressContainer: {
-    position: "absolute",
-    justifyContent: "center",
-    alignItems: "center",
+  // --- TOP SECTION (Instruction) ---
+  topSection: {
+    marginTop: Platform.OS === 'ios' ? 50 : 30,
+    alignItems: 'center',
+    width: '100%',
+    height: 120, // Reserve height so it doesn't jump
+    justifyContent: 'center',
   },
-  challengeInstruction: {
-    position: "absolute",
-    top: 100,
-    left: 0,
-    right: 0,
-    alignItems: "center",
-    backgroundColor: "transparent",
+  challengeContainer: {
+    alignItems: 'center',
+    backgroundColor: 'rgba(0,0,0,0.6)',
+    paddingVertical: 15,
+    paddingHorizontal: 40,
+    borderRadius: 30,
+    borderWidth: 1,
+    borderColor: 'rgba(255,255,255,0.2)',
   },
-  challengeIcon: {
-    fontSize: 48,
-    marginBottom: 8,
+  directionIcon: {
+    fontSize: 48, // Large arrow icon
+    marginBottom: 5,
+    color: "#FFF",
   },
   challengeText: {
     fontSize: 24,
+    fontWeight: "800",
+    color: "#FFF",
+    textTransform: "uppercase",
+    letterSpacing: 1.2,
+    textAlign: "center",
+  },
+  subText: {
+    fontSize: 14,
+    color: THEME_COLOR,
+    marginTop: 4,
     fontWeight: "bold",
-    color: "#FFFFFF",
-    textAlign: "center",
-    textShadowColor: "rgba(0, 0, 0, 0.75)",
-    textShadowOffset: { width: 2, height: 2 },
-    textShadowRadius: 10,
   },
-  blinkCount: {
-    fontSize: 18,
-    color: "#FFFFFF",
-    textAlign: "center",
-    marginTop: 8,
-    textShadowColor: "rgba(0, 0, 0, 0.75)",
-    textShadowOffset: { width: 2, height: 2 },
-    textShadowRadius: 10,
-  },
-  processingContainer: {
-    position: "absolute",
-    top: 100,
-    left: 0,
-    right: 0,
-    alignItems: "center",
+  processingBadge: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: THEME_COLOR,
+    paddingVertical: 12,
+    paddingHorizontal: 24,
+    borderRadius: 30,
   },
   processingText: {
-    fontSize: 24,
-    fontWeight: "bold",
-    color: "#FFFFFF",
-    textAlign: "center",
-    textShadowColor: "rgba(0, 0, 0, 0.75)",
-    textShadowOffset: { width: 2, height: 2 },
-    textShadowRadius: 10,
-  },
-  attemptsContainer: {
-    position: "absolute",
-    bottom: 100,
-    left: 0,
-    right: 0,
-    alignItems: "center",
-  },
-  attemptsText: {
-    fontSize: 18,
-    color: "#FFFFFF",
-    textAlign: "center",
-    textShadowColor: "rgba(0, 0, 0, 0.75)",
-    textShadowOffset: { width: 2, height: 2 },
-    textShadowRadius: 10,
-  },
-  debugContainer: {
-    position: "absolute",
-    bottom: 60,
-    left: 0,
-    right: 0,
-    alignItems: "center",
-  },
-  debugText: {
-    fontSize: 14,
-    color: "#FFFFFF",
-    textAlign: "center",
-    opacity: 0.7,
-  },
-  fullScreenOverlay: {
-    ...StyleSheet.absoluteFillObject,
-    backgroundColor: "rgba(0, 0, 0, 0.85)",
-    justifyContent: "center",
-    alignItems: "center",
-    zIndex: 9999,
-  },
-  loaderContainer: {
-    padding: 24,
-    backgroundColor: "rgba(255,255,255,0.1)",
-    borderRadius: 20,
-    alignItems: "center",
-  },
-  loaderText: {
-    color: "#FFFFFF",
-    fontSize: 22,
+    color: "#FFF",
+    fontSize: 16,
     fontWeight: "600",
+    marginLeft: 10,
+  },
+
+  // --- CENTER (Cutout) ---
+  cutoutContainer: {
+    position: "absolute",
+    alignItems: "center",
+    justifyContent: "center",
+    zIndex: 10,
+  },
+  progressRing: {
+    position: "absolute",
+  },
+  bracket: {
+    position: "absolute",
+    width: 40,
+    height: 40,
+    borderColor: THEME_COLOR,
+    borderWidth: 4,
+  },
+  bracketTL: { top: 0, left: 0, borderRightWidth: 0, borderBottomWidth: 0, borderTopLeftRadius: 20 },
+  bracketTR: { top: 0, right: 0, borderLeftWidth: 0, borderBottomWidth: 0, borderTopRightRadius: 20 },
+  bracketBL: { bottom: 0, left: 0, borderRightWidth: 0, borderTopWidth: 0, borderBottomLeftRadius: 20 },
+  bracketBR: { bottom: 0, right: 0, borderLeftWidth: 0, borderTopWidth: 0, borderBottomRightRadius: 20 },
+  centerContent: {
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  countdownText: {
+    fontSize: 72,
+    fontWeight: "bold",
+    color: "#FFF",
+    textShadowColor: "rgba(0,0,0,0.5)",
+    textShadowOffset: { width: 0, height: 2 },
+    textShadowRadius: 10,
+  },
+  statusText: {
+    fontSize: 18,
+    color: THEME_COLOR,
+    fontWeight: "600",
+    marginTop: 10,
+    textTransform: "uppercase",
+    letterSpacing: 2,
+    textShadowColor: "rgba(0,0,0,0.75)",
+    textShadowOffset: { width: 0, height: 1 },
+    textShadowRadius: 3,
+  },
+
+  // --- BOTTOM SECTION (Attempts) ---
+  bottomSection: {
+    marginBottom: 20,
+    alignItems: 'center',
+    width: '100%',
+  },
+  footerTitle: {
+    fontSize: 18,
+    fontWeight: "600",
+    color: "rgba(255,255,255,0.7)",
+    letterSpacing: 0.5,
+  },
+  footerSubtitle: {
+    fontSize: 16,
+    color: "#FFF",
+    marginTop: 4,
+    fontWeight: "bold",
   },
 });

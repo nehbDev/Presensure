@@ -3,20 +3,13 @@ import {
   View,
   Text,
   FlatList,
-  ActivityIndicator,
   TouchableOpacity,
   RefreshControl,
   Dimensions,
 } from "react-native";
 import AsyncStorage from "@react-native-async-storage/async-storage";
-import API_URL from "../api/apiConfig";
-
-const subjectColors: Record<string, string> = {
-  Culture: "bg-purple-500",
-  History: "bg-red-400",
-  Math: "bg-yellow-400",
-  Literature: "bg-green-500",
-};
+import { API_URL } from "../api/apiConfig";
+import ScheduleSkeleton from "../components/skeleton/ScheduleSkeleton";
 
 // --- Helper: Parse schedule days like "MTWThFSSu"
 const parseDayCodes = (days: string): string[] => {
@@ -39,13 +32,7 @@ const parseDayCodes = (days: string): string[] => {
 };
 
 const dayMap: Record<string, number> = {
-  M: 1,
-  T: 2,
-  W: 3,
-  Th: 4,
-  F: 5,
-  S: 6,
-  Su: 0,
+  M: 1, T: 2, W: 3, Th: 4, F: 5, S: 6, Su: 0,
 };
 
 const parseTimeToMinutes = (timeStr: string) => {
@@ -91,7 +78,7 @@ export default function HomeScreen({ navigation }: any) {
     } catch (error) {
       console.error("Error loading user or subjects:", error);
     } finally {
-      setLoading(false);
+      setTimeout(() => setLoading(false), 500);
     }
   };
 
@@ -138,40 +125,31 @@ export default function HomeScreen({ navigation }: any) {
     );
   };
 
-  // Create a unique key for each schedule item
   const generateUniqueKey = (item: any, index: number) => {
-    // Try to use schedule_id first, then fall back to combination of other fields
-    if (item.schedule_id) {
-      return `schedule-${item.schedule_id}`;
-    }
-    if (item.id) {
-      return `item-${item.id}`;
-    }
-    // Fallback: combine multiple fields to create a unique key
+    if (item.schedule_id) return `schedule-${item.schedule_id}`;
+    if (item.id) return `item-${item.id}`;
     return `schedule-${item.course_id}-${item.days}-${item.start_time}-${item.end_time}-${index}`;
   };
 
   const getFilteredSchedules = () => {
     const now = new Date();
     const currentDay = now.getDay();
+    // Get current time in minutes (e.g., 14:30 = 870 minutes)
+    const currentTimeMinutes = now.getHours() * 60 + now.getMinutes();
 
     if (activeTab === "all") {
       let allSchedules = [...subjects];
 
-      // Filter by selected day group if any
       if (selectedDayGroup) {
         allSchedules = allSchedules.filter(
           (s) => normalizeDays(s.days) === selectedDayGroup
         );
       }
 
-      // Sort: active schedules first, then by start time
       allSchedules.sort((a, b) => {
         const aActive = isScheduleActive(a, false);
         const bActive = isScheduleActive(b, false);
-
         if (aActive !== bActive) return aActive ? -1 : 1;
-
         return (
           parseTimeToMinutes(a.start_time) - parseTimeToMinutes(b.start_time)
         );
@@ -180,141 +158,155 @@ export default function HomeScreen({ navigation }: any) {
       return allSchedules;
     }
 
-    // Today tab
+    // --- UPDATED "TODAY" LOGIC ---
     const todaySchedules = subjects.filter((schedule) => {
       const scheduleCodes = parseDayCodes(schedule.days || "");
-      return scheduleCodes.some((code) => dayMap[code] === currentDay);
+      
+      // 1. Check if the schedule is for today
+      const isToday = scheduleCodes.some((code) => dayMap[code] === currentDay);
+      
+      if (!isToday) return false;
+
+      // 2. Check if the schedule has NOT ended yet
+      const endMinutes = parseTimeToMinutes(schedule.end_time);
+      
+      // We keep the schedule if Current Time <= End Time
+      return currentTimeMinutes <= endMinutes;
     });
 
-    // Sort: active first, then by start time
     return todaySchedules.sort((a, b) => {
       const aActive = isScheduleActive(a, false);
       const bActive = isScheduleActive(b, false);
       if (aActive !== bActive) return aActive ? -1 : 1;
-
       return (
         parseTimeToMinutes(a.start_time) - parseTimeToMinutes(b.start_time)
       );
     });
   };
 
-  if (loading) {
-    return (
-      <View className="flex-1 justify-center items-center bg-gray-100">
-        <ActivityIndicator size="large" color="#3b82f6" />
-        <Text className="mt-3 text-gray-500 text-base">Loading...</Text>
-      </View>
-    );
-  }
-
   return (
     <View className="flex-1 bg-gray-100 px-4 pt-4">
       {/* Tabs */}
       <View className="flex-row justify-between mb-6 bg-gray-200 rounded-full p-2">
         <TouchableOpacity
-          className={`flex-1 py-2 rounded-full ${activeTab === "today" ? "bg-white" : ""}`}
+          className={`flex-1 py-2 rounded-full ${
+            activeTab === "today" ? "bg-white" : ""
+          }`}
           onPress={() => setActiveTab("today")}
         >
           <Text
-            className={`text-center font-semibold ${activeTab === "today" ? "text-gray-700" : "text-gray-500"}`}
+            className={`text-center font-semibold ${
+              activeTab === "today" ? "text-gray-700" : "text-gray-500"
+            }`}
           >
             Today's Schedule
           </Text>
         </TouchableOpacity>
 
         <TouchableOpacity
-          className={`flex-1 py-2 rounded-full ${activeTab === "all" ? "bg-white" : ""}`}
+          className={`flex-1 py-2 rounded-full ${
+            activeTab === "all" ? "bg-white" : ""
+          }`}
           onPress={() => setActiveTab("all")}
         >
           <Text
-            className={`text-center font-semibold ${activeTab === "all" ? "text-gray-700" : "text-gray-500"}`}
+            className={`text-center font-semibold ${
+              activeTab === "all" ? "text-gray-700" : "text-gray-500"
+            }`}
           >
             All Schedule
           </Text>
         </TouchableOpacity>
       </View>
 
-      {/* Schedule List */}
-      <FlatList
-        data={getFilteredSchedules()}
-        keyExtractor={(item, index) => generateUniqueKey(item, index)}
-        numColumns={1}
-        renderItem={({ item }) => {
-          // Always check current day and time, even in "all" tab
-          const active = isScheduleActive(item, false);
+      {/* Content Area: Loading Skeleton OR Real List */}
+      {loading ? (
+        <View>
+          {[1, 2, 3, 4, 5].map((key) => (
+            <ScheduleSkeleton key={key} width={windowWidth - 32} />
+          ))}
+        </View>
+      ) : (
+        <FlatList
+          data={getFilteredSchedules()}
+          keyExtractor={(item, index) => generateUniqueKey(item, index)}
+          numColumns={1}
+          renderItem={({ item }) => {
+            const active = isScheduleActive(item, false);
 
-          return (
-            <TouchableOpacity
-              onPress={() =>
-                navigation.navigate("ViewScheduleScreen", {
-                  schedule: item,
-                  // Pass additional data for the header
-                  headerTitle: `Schedule #${item.schedule_id}`,
-                })
-              }
-              style={{ width: windowWidth - 32, marginBottom: 16 }}
-            >
-              <View
-                className="bg-white rounded-2xl p-5 shadow-lg flex flex-col justify-between"
-                style={{
-                  borderWidth: active ? 3 : 1,
-                  borderColor: active ? "#34D399" : "#e5e7eb",
-                  elevation: 5,
-                  minHeight: 140,
-                }}
+            return (
+              <TouchableOpacity
+                onPress={() =>
+                  navigation.navigate("ViewScheduleScreen", {
+                    schedule: item,
+                    headerTitle: `Schedule #${item.schedule_id}`,
+                  })
+                }
+                style={{ width: windowWidth - 32, marginBottom: 16 }}
               >
-                {/* Top section: Subject Title */}
-                <View className="flex-row items-center mb-2">
-                  <View className="bg-blue-100 rounded-full p-2 mr-2">
-                    <Text className="text-blue-600 font-bold">📘</Text>
-                  </View>
-                  <Text className="text-gray-900 text-lg font-semibold flex-1 flex-wrap">
-                    {item.subject_description || "No Subject"}
-                  </Text>
-                </View>
-
-                {/* Days and Room */}
-                <Text className="text-gray-600 text-sm mb-2">
-                  {item.days || "No days"} | {item.room || "No room"}
-                </Text>
-
-                {/* Time and Schedule Type in one row */}
-                <View className="flex-row justify-between items-center">
-                  <Text className="text-indigo-700 text-base font-medium">
-                    {formatTime(item.start_time)} - {formatTime(item.end_time)}
-                  </Text>
-                  <View className="bg-blue-50 px-3 py-1 rounded-full">
-                    <Text className="text-blue-600 text-xs font-medium uppercase">
-                      {item.schedule_type || "Regular"}
+                <View
+                  className="bg-white rounded-2xl p-5 shadow-lg flex flex-col justify-between"
+                  style={{
+                    borderWidth: active ? 3 : 1,
+                    borderColor: active ? "#34D399" : "#e5e7eb",
+                    elevation: 5,
+                    minHeight: 140,
+                  }}
+                >
+                  {/* Top section: Subject Title */}
+                  <View className="flex-row items-center mb-2">
+                    <View className="bg-blue-100 rounded-full p-2 mr-2">
+                      <Text className="text-blue-600 font-bold">📘</Text>
+                    </View>
+                    <Text className="text-gray-900 text-lg font-semibold flex-1 flex-wrap">
+                      {item.subject_description || "No Subject"}
                     </Text>
                   </View>
+
+                  {/* Days and Room */}
+                  <Text className="text-gray-600 text-sm mb-2">
+                    {item.days || "No days"} | {item.room || "No room"}
+                  </Text>
+
+                  {/* Time and Schedule Type in one row */}
+                  <View className="flex-row justify-between items-center">
+                    <Text className="text-blue-600 text-base font-medium">
+                      {formatTime(item.start_time)} -{" "}
+                      {formatTime(item.end_time)}
+                    </Text>
+                    <View className="bg-blue-50 px-3 py-1 rounded-full">
+                      <Text className="text-blue-600 text-xs font-medium uppercase">
+                        {item.schedule_type || "Regular"}
+                      </Text>
+                    </View>
+                  </View>
                 </View>
-              </View>
-            </TouchableOpacity>
-          );
-        }}
-        refreshControl={
-          <RefreshControl
-            refreshing={refreshing}
-            onRefresh={onRefresh}
-            colors={["#3b82f6"]}
-            tintColor="#3b82f6"
-          />
-        }
-        contentContainerStyle={{ paddingBottom: 70 }}
-        ListEmptyComponent={
-          <View className="flex-1 justify-center items-center mt-10">
-            <Text className="text-center text-gray-500 text-lg">
-              No schedules found
-            </Text>
-            <Text className="text-center text-gray-400 mt-2">
-              {activeTab === "today"
-                ? "You have no schedules for today"
-                : "No schedules available"}
-            </Text>
-          </View>
-        }
-      />
+              </TouchableOpacity>
+            );
+          }}
+          refreshControl={
+            <RefreshControl
+              refreshing={refreshing}
+              onRefresh={onRefresh}
+              colors={["#3b82f6"]}
+              tintColor="#3b82f6"
+            />
+          }
+          contentContainerStyle={{ paddingBottom: 70 }}
+          ListEmptyComponent={
+            <View className="flex-1 justify-center items-center mt-10">
+              <Text className="text-center text-gray-500 text-lg">
+                No upcoming schedules
+              </Text>
+              <Text className="text-center text-gray-400 mt-2 px-6">
+                {activeTab === "today"
+                  ? "You have no more classes for today!"
+                  : "No schedules available"}
+              </Text>
+            </View>
+          }
+        />
+      )}
     </View>
   );
 }

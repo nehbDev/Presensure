@@ -1,5 +1,5 @@
 import React, { useEffect, useState } from 'react';
-import { View, Text, AppState } from 'react-native';
+import { View, Text, AppState, Platform } from 'react-native';
 import { isStudentTaskRunning, getCurrentStudentTask } from '../utils/backgroundTask';
 
 const StudentConnectionIndicator: React.FC = () => {
@@ -65,7 +65,11 @@ const StudentConnectionIndicator: React.FC = () => {
   if (!studentBackgroundActive) return null;
 
   return (
-    <View className="absolute top-10 right-4 z-50">
+    <View
+          className={`absolute right-4 ${
+            Platform.OS === 'ios' ? 'top-[30px]' : 'top-[20px]'
+          } justify-center`}
+        >
       <View className="bg-blue-500 px-3 py-2 rounded-full shadow-lg flex-row items-center">
         <View className="w-2 h-2 bg-white rounded-full mr-2 animate-pulse" />
         <Text className="text-white text-xs font-semibold">

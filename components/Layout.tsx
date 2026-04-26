@@ -1,4 +1,4 @@
-import React, { useEffect, useState, } from "react";
+import React, { useEffect, useState } from "react";
 import { createBottomTabNavigator } from "@react-navigation/bottom-tabs";
 import {
   Dimensions,
@@ -8,12 +8,19 @@ import {
   View,
   Image,
   Platform,
-  StatusBar
+  StatusBar,
 } from "react-native";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { useNavigation } from "@react-navigation/native";
-import { Ionicons, MaterialIcons, FontAwesome5 } from "@expo/vector-icons";
-import { stopInstructorTask, stopStudentScanningTask } from "../utils/backgroundTask";
+import {
+  Ionicons,
+  MaterialCommunityIcons,
+  FontAwesome5,
+} from "@expo/vector-icons";
+import {
+  stopInstructorTask,
+  stopStudentScanningTask,
+} from "../utils/backgroundTask";
 import ProfileScreen from "../screens/profileScreen"; // ✅ Import ProfileScreen
 
 const Tab = createBottomTabNavigator();
@@ -21,7 +28,7 @@ const { width } = Dimensions.get("window");
 
 const styles = StyleSheet.create({
   headerContainer: {
-    backgroundColor: "#50A8EE",
+    backgroundColor: "#2563EB",
     paddingTop: Platform.OS === "ios" ? 10 : 6,
     paddingBottom: 10,
     paddingHorizontal: 16,
@@ -42,7 +49,7 @@ const styles = StyleSheet.create({
     bottom: 15,
     marginHorizontal: 20,
     height: 70, // ensures icons + labels are fully visible
-    borderRadius: 30,
+    borderRadius: 40,
     backgroundColor: "white",
     shadowColor: "#000",
     shadowOffset: { width: 0, height: 5 },
@@ -53,7 +60,6 @@ const styles = StyleSheet.create({
     paddingBottom: 10,
   },
 });
-
 
 interface User {
   id: string;
@@ -72,6 +78,18 @@ export default function Layout({
 }) {
   const navigation = useNavigation();
   const [user, setUser] = useState<User | null>(null);
+
+  const getGreeting = () => {
+    const hour = new Date().getHours();
+
+    if (hour < 12) {
+      return "Good Morning";
+    } else if (hour < 18) {
+      return "Good Afternoon";
+    } else {
+      return "Good Evening";
+    }
+  };
 
   useEffect(() => {
     const loadUser = async () => {
@@ -99,19 +117,19 @@ export default function Layout({
 
   const headerComponent = () => (
     <View style={styles.headerContainer}>
-      <Text style={styles.headerGreeting}>Good morning,</Text>
+      <Text style={styles.headerGreeting}>{getGreeting()},</Text>
       <Text style={styles.headerName}>{user?.name || "User"}!</Text>
     </View>
   );
 
   const tabBarOptions = {
-  tabBarActiveTintColor: "#50A8EE",
-  tabBarInactiveTintColor: "gray",
-  tabBarShowLabel: true,
-  tabBarLabelStyle: { fontSize: 12, marginBottom: 4 },
-  tabBarIconStyle: { marginTop: 4 },
-  tabBarStyle: styles.tabBarStyle,
-};
+    tabBarActiveTintColor: "#2563EB",
+    tabBarInactiveTintColor: "gray",
+    tabBarShowLabel: true,
+    tabBarLabelStyle: { fontSize: 12, marginBottom: 4 },
+    tabBarIconStyle: { marginTop: 4 },
+    tabBarStyle: styles.tabBarStyle,
+  };
 
   return (
     <Tab.Navigator
@@ -121,9 +139,13 @@ export default function Layout({
           tabBarIcon: ({ color, size }) => {
             if (route.name === "HomeScreen")
               return <Ionicons name="home" size={size} color={color} />;
-            if (route.name === "DetailsScreen")
+            if (route.name === "RecordsScreen")
               return (
-                <MaterialIcons name="list-alt" size={size} color={color} />
+                <MaterialCommunityIcons
+                  name="file-document-multiple"
+                  size={size}
+                  color={color}
+                />
               );
             if (route.name === "ProfileScreen")
               return (
@@ -144,8 +166,8 @@ export default function Layout({
             title:
               name === "HomeScreen"
                 ? "Home"
-                : name === "DetailsScreen"
-                  ? "Details"
+                : name === "RecordsScreen"
+                  ? "Records"
                   : name === "ProfileScreen"
                     ? "Profile" // ✅ Set title for ProfileScreen
                     : name,

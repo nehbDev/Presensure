@@ -1,8 +1,21 @@
 import React, { useState } from "react";
-import { View, Text, TouchableOpacity, Modal, Alert } from "react-native";
+import {
+  View,
+  Text,
+  TouchableOpacity,
+  Modal,
+  Alert,
+  ActivityIndicator,
+  Linking,
+  Platform,
+  StyleSheet,
+  Dimensions,
+} from "react-native";
 import { Device } from "react-native-ble-plx";
 import { Ionicons } from "@expo/vector-icons";
 import { stopInstructorTask } from "../utils/backgroundTask";
+
+const { width } = Dimensions.get("window");
 
 interface InstructorViewProps {
   isConnected: boolean;
@@ -36,8 +49,16 @@ const InstructorView: React.FC<InstructorViewProps> = ({
   const [showDisconnectModal, setShowDisconnectModal] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
 
+  const openBluetoothSettings = () => {
+    if (Platform.OS === "android") {
+      Linking.sendIntent("android.settings.BLUETOOTH_SETTINGS");
+    } else {
+      Linking.openSettings();
+    }
+  };
+
   const handleDisconnectPress = () => {
-    if (sessionStatus === "active" && activeSessionId) {
+    if (activeSessionId) {
       setShowDisconnectModal(true);
     } else {
       handleDisconnect();
@@ -46,7 +67,6 @@ const InstructorView: React.FC<InstructorViewProps> = ({
 
   const handleCompleteSession = async () => {
     if (!activeSessionId) return;
-
     setIsProcessing(true);
     try {
       await stopInstructorTask();
@@ -62,7 +82,6 @@ const InstructorView: React.FC<InstructorViewProps> = ({
 
   const handleCancelSession = async () => {
     if (!activeSessionId) return;
-
     setIsProcessing(true);
     try {
       await stopInstructorTask();
@@ -82,215 +101,410 @@ const InstructorView: React.FC<InstructorViewProps> = ({
     }
   };
 
-  // Show Bluetooth off state
+  // --- 1. Bluetooth Off ---
   if (!isBluetoothOn) {
     return (
-      <View className="mx-4 mb-4 p-4 rounded-2xl bg-red-50 border border-red-200">
-        <View className="flex-row items-center">
-          <View className="bg-red-100 p-2 rounded-full mr-3">
-            <Ionicons name="bluetooth" size={20} color="#dc2626" />
+      <View style={styles.container}>
+        <View style={styles.card}>
+          <View style={[styles.iconContainer, { backgroundColor: "#EFF6FF" }]}>
+            <Ionicons name="bluetooth" size={32} color="#2563EB" />
           </View>
-          <View className="flex-1">
-            <Text className="text-red-800 font-semibold">
-              Bluetooth is Turned Off
-            </Text>
-            <Text className="text-red-600 text-sm mt-1">
-              Please enable Bluetooth to scan for devices and start attendance
-              sessions
-            </Text>
-          </View>
+          <Text style={styles.title}>Bluetooth Required</Text>
+          <Text style={styles.description}>
+            Bluetooth must be enabled to connect to the classroom device and
+            manage attendance.
+          </Text>
+          <TouchableOpacity
+            onPress={openBluetoothSettings}
+            style={styles.primaryButton}
+            activeOpacity={0.8}
+          >
+            <Text style={styles.primaryButtonText}>Turn On Bluetooth</Text>
+          </TouchableOpacity>
         </View>
       </View>
     );
   }
 
-  // Show connected state
-  if (isConnected) {
+  // --- 2. Active Session ---
+  const isSessionActive = sessionStatus === "active" && activeSessionId;
+
+  if (isSessionActive || isConnected) {
+    const isLiveConnection = isConnected && connectedDevice;
+
     return (
-      <>
-        <View className="mx-4 mb-4 p-4 rounded-2xl bg-green-50 border border-green-200">
-          <View className="flex-row items-center mb-2">
-            <View className="bg-green-100 p-2 rounded-full mr-3">
-              <Ionicons name="bluetooth" size={20} color="#059669" />
+      <View style={styles.container}>
+        <View
+          style={[
+            styles.card,
+            isLiveConnection ? styles.cardActive : styles.cardWarning,
+          ]}
+        >
+          <View style={styles.row}>
+            <View
+              style={[
+                styles.smallIcon,
+                isLiveConnection ? styles.bgGreen : styles.bgOrange,
+              ]}
+            >
+              <Ionicons
+                name={isLiveConnection ? "bluetooth" : "cloud-offline-outline"}
+                size={20}
+                color={isLiveConnection ? "#059669" : "#D97706"}
+              />
             </View>
-            <View className="flex-1">
-              <Text className="text-green-800 font-semibold">
-                Connected to {connectedDevice?.name || connectedDevice?.id}
+            <View style={styles.flex1}>
+              <Text style={styles.cardTitle}>
+                {isLiveConnection
+                  ? `Connected: ${connectedDevice?.name || "Device"}`
+                  : "Session In Progress"}
               </Text>
-              <Text className="text-green-600 text-sm mt-1">
-                Attendance session is{" "}
-                {sessionStatus === "active" ? "active" : "ready"}
+              <Text style={styles.cardSubtext}>
+                {isLiveConnection
+                  ? "Broadcasting presence to students."
+                  : "Bluetooth disconnected. Attendance active."}
               </Text>
-              {activeSessionId && (
-                <Text className="text-green-600 text-xs mt-1">
-                  Session ID: {activeSessionId}
-                </Text>
-              )}
             </View>
           </View>
+
           <TouchableOpacity
             onPress={handleDisconnectPress}
             disabled={isProcessing}
-            className={`mt-3 py-2 px-4 rounded-lg flex-row items-center justify-center self-start ${
-              isProcessing ? "bg-gray-400" : "bg-red-500"
-            }`}
+            style={[styles.actionButton, styles.bgRed]}
           >
-            <Ionicons name="close-circle" size={16} color="white" />
-            <Text className="text-white ml-2 font-medium">
-              {isProcessing ? "Processing..." : "Disconnect"}
+            {isProcessing ? (
+              <ActivityIndicator size="small" color="white" />
+            ) : (
+              <Ionicons name="power" size={18} color="white" />
+            )}
+            <Text style={styles.actionButtonText}>
+              {isProcessing ? "Processing..." : "End Session"}
             </Text>
           </TouchableOpacity>
         </View>
 
-        {/* Disconnect Confirmation Modal */}
+        {/* Modal */}
         <Modal
           visible={showDisconnectModal}
           transparent={true}
           animationType="fade"
           onRequestClose={handleCloseModal}
         >
-          <View className="flex-1 justify-center items-center">
-            <View className="bg-white rounded-2xl p-6 mx-4 w-11/12 max-w-md  border-2 border-blue-600">
-              <View className="flex-row items-center m-3">
-                <View className="bg-blue-100 p-2 rounded-full mr-3">
-                  <Ionicons
-                    name="information-circle"
-                    size={24}
-                    color="#3b82f6"
-                  />
+          <View style={styles.modalOverlay}>
+            <View style={styles.modalContent}>
+              <View style={styles.modalHeader}>
+                <View style={[styles.smallIcon, styles.bgBlue]}>
+                  <Ionicons name="settings-sharp" size={24} color="#2563EB" />
                 </View>
-                <Text className="text-gray-600">
-                  How would you like to end this attendance session?
-                </Text>
+                <View style={styles.modalHeaderText}>
+                  <Text style={styles.title}>Manage Session</Text>
+                  <Text style={styles.description}>
+                    Choose an action to close the class.
+                  </Text>
+                </View>
               </View>
 
-              <View className="space-y-3">
-                <TouchableOpacity
-                  onPress={handleCompleteSession}
-                  disabled={isProcessing}
-                  className={`flex-row items-center p-4 rounded-xl border mb-2 ${
-                    isProcessing
-                      ? "bg-gray-100 border-gray-300"
-                      : "bg-green-50 border-green-200"
-                  }`}
-                >
-                  <View
-                    className={`p-2 rounded-full mr-3 ${
-                      isProcessing ? "bg-gray-200" : "bg-green-100"
-                    }`}
-                  >
-                    <Ionicons
-                      name="checkmark-circle"
-                      size={20}
-                      color={isProcessing ? "#9ca3af" : "#059669"}
-                    />
-                  </View>
-                  <View className="flex-1">
-                    <Text
-                      className={`font-semibold ${
-                        isProcessing ? "text-gray-500" : "text-green-800"
-                      }`}
-                    >
-                      Complete Session
-                    </Text>
-                  </View>
-                </TouchableOpacity>
-
-                <TouchableOpacity
-                  onPress={handleCancelSession}
-                  disabled={isProcessing}
-                  className={`flex-row items-center p-4 rounded-xl border ${
-                    isProcessing
-                      ? "bg-gray-100 border-gray-300"
-                      : "bg-yellow-50 border-yellow-200"
-                  }`}
-                >
-                  <View
-                    className={`p-2 rounded-full mr-3 ${
-                      isProcessing ? "bg-gray-200" : "bg-yellow-100"
-                    }`}
-                  >
-                    <Ionicons
-                      name="close-circle"
-                      size={20}
-                      color={isProcessing ? "#9ca3af" : "#d97706"}
-                    />
-                  </View>
-                  <View className="flex-1">
-                    <Text
-                      className={`font-semibold ${
-                        isProcessing ? "text-gray-500" : "text-yellow-800"
-                      }`}
-                    >
-                      Cancel Session
-                    </Text>
-                  </View>
-                </TouchableOpacity>
-              </View>
+              <TouchableOpacity
+                onPress={handleCompleteSession}
+                disabled={isProcessing}
+                style={[styles.modalOption, styles.borderGreen]}
+              >
+                <Ionicons
+                  name="checkmark-done-circle"
+                  size={28}
+                  color="#059669"
+                />
+                <View style={styles.optionTextContainer}>
+                  <Text style={[styles.optionTitle, { color: "#059669" }]}>
+                    Complete Session
+                  </Text>
+                  <Text style={styles.optionSub}>Save attendance records.</Text>
+                </View>
+              </TouchableOpacity>
+              {/*
+              <TouchableOpacity
+                onPress={handleCancelSession}
+                disabled={isProcessing}
+                style={[styles.modalOption, styles.borderRed]}
+              >
+                <Ionicons name="trash-bin" size={24} color="#DC2626" />
+                <View style={styles.optionTextContainer}>
+                  <Text style={[styles.optionTitle, { color: "#DC2626" }]}>
+                    Cancel Session
+                  </Text>
+                  <Text style={styles.optionSub}>Discard all data.</Text>
+                </View>
+              </TouchableOpacity>
+              */}
 
               {!isProcessing && (
                 <TouchableOpacity
                   onPress={handleCloseModal}
-                  className="mt-6 py-3 rounded-lg bg-gray-100"
+                  style={styles.closeButton}
                 >
-                  <Text className="text-gray-700 text-center font-medium">
-                    Continue Session
-                  </Text>
+                  <Text style={styles.closeButtonText}>Go Back</Text>
                 </TouchableOpacity>
               )}
             </View>
           </View>
         </Modal>
-      </>
+      </View>
     );
   }
 
-  // Show scan state (Bluetooth is on but not connected)
+  // --- 3. Scanning State ---
   return (
-    <View className="mx-4 mb-4">
-      <View className="flex-row items-center justify-between mb-4">
-        <Text className="text-lg font-bold text-gray-900">Nearby Devices</Text>
+    <View style={styles.container}>
+      {/* Info Card */}
+      <View style={styles.infoCard}>
+        <View style={styles.row}>
+          <Ionicons name="information-circle" size={20} color="#2563EB" />
+          <Text style={styles.infoTitle}>How to Start</Text>
+        </View>
+        <Text style={styles.infoText}>
+          1. Tap "Scan for Devices".{"\n"}
+          2. Connect to the room's ESP32.{"\n"}
+          3. Attendance marking will begin automatically.
+        </Text>
+      </View>
 
+      <View style={styles.headerRow}>
+        <Text style={styles.sectionTitle}>Nearby Devices</Text>
         {scanning && (
-          <View className="flex-row items-center">
-            <View className="h-2 w-2 bg-blue-500 rounded-full mr-1 animate-pulse" />
-            <Text className="text-blue-500 text-sm">Scanning</Text>
+          <View style={styles.row}>
+            <ActivityIndicator size="small" color="#2563EB" />
+            <Text style={styles.scanningText}>Scanning...</Text>
           </View>
         )}
       </View>
 
-      {!isBluetoothOn ? (
-        <View className="py-3 px-6 rounded-lg bg-gray-100 border border-gray-300">
-          <Text className="text-gray-500 text-center font-medium">
-            Bluetooth Required for Scanning
-          </Text>
+      {/* Main Scan Action Card */}
+      <View style={styles.scanCard}>
+        <View style={styles.scanIconWrapper}>
+          <Ionicons
+            name={scanning ? "radio" : "bluetooth"}
+            size={40}
+            color={isScheduleTime ? "#2563EB" : "#9CA3AF"}
+          />
         </View>
-      ) : (
-        <>
-          {!scanning && (
-            <TouchableOpacity
-              onPress={onStartScan}
-              disabled={!isScheduleTime}
-              className={`py-3 px-6 rounded-lg flex-row items-center justify-center self-start ${
-                isScheduleTime ? "bg-blue-500" : "bg-gray-400"
-              }`}
-            >
-              <Ionicons name="bluetooth" size={18} color="white" />
-              <Text className="text-white ml-2 font-medium text-base">
-                {isScheduleTime ? "Scan for Devices" : "Scanning Disabled"}
-              </Text>
-            </TouchableOpacity>
-          )}
+        <Text style={styles.scanStatusText}>
+          {scanning
+            ? "Searching for devices..."
+            : isScheduleTime
+              ? "Ready to connect"
+              : "Class not started"}
+        </Text>
 
-          {!isScheduleTime && (
-            <Text className="text-gray-500 text-sm mt-2">
-              Scanning only available during class hours
+        {!scanning && (
+          <TouchableOpacity
+            onPress={onStartScan}
+            disabled={!isScheduleTime}
+            style={[
+              styles.primaryButton,
+              !isScheduleTime && styles.disabledButton,
+            ]}
+          >
+            <Text style={styles.primaryButtonText}>
+              {isScheduleTime ? "Scan for Devices" : "Scanning Disabled"}
             </Text>
-          )}
-        </>
+          </TouchableOpacity>
+        )}
+      </View>
+
+      {!isScheduleTime && (
+        <Text style={styles.footerNote}>
+          Available only during scheduled hours.
+        </Text>
       )}
     </View>
   );
 };
+
+// --- BLUE THEME STYLESHEET ---
+const styles = StyleSheet.create({
+  container: {
+    paddingHorizontal: 16,
+    marginBottom: 16,
+  },
+  flex1: { flex: 1 },
+  row: { flexDirection: "row", alignItems: "center" },
+
+  // Cards
+  card: {
+    backgroundColor: "#FFFFFF",
+    borderRadius: 16,
+    padding: 20,
+    alignItems: "center",
+    borderWidth: 1,
+    borderColor: "#E2E8F0",
+    shadowColor: "#2563EB",
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.05,
+    shadowRadius: 8,
+    elevation: 3,
+  },
+  cardActive: { borderColor: "#34D399", backgroundColor: "#ECFDF5" },
+  cardWarning: { borderColor: "#FBBF24", backgroundColor: "#FFFBEB" },
+
+  infoCard: {
+    backgroundColor: "#EFF6FF",
+    borderRadius: 12,
+    padding: 16,
+    marginBottom: 16,
+    borderWidth: 1,
+    borderColor: "#DBEAFE",
+  },
+  scanCard: {
+    backgroundColor: "white",
+    borderRadius: 20,
+    padding: 24,
+    alignItems: "center",
+    borderWidth: 1,
+    borderColor: "#E2E8F0",
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.05,
+    shadowRadius: 4,
+    elevation: 2,
+  },
+
+  // Text
+  title: { fontSize: 18, fontWeight: "700", color: "#1E3A8A", marginBottom: 8 },
+  description: {
+    fontSize: 14,
+    color: "#64748B",
+    textAlign: "center",
+    marginBottom: 20,
+    lineHeight: 20,
+  },
+  infoTitle: {
+    color: "#1E40AF",
+    fontWeight: "700",
+    marginLeft: 6,
+    fontSize: 15,
+  },
+  infoText: { color: "#3B82F6", fontSize: 13, marginTop: 8, lineHeight: 20 },
+  sectionTitle: { fontSize: 18, fontWeight: "700", color: "#1E293B" },
+  scanningText: {
+    color: "#2563EB",
+    fontSize: 13,
+    marginLeft: 6,
+    fontWeight: "500",
+  },
+  scanStatusText: {
+    color: "#475569",
+    fontSize: 16,
+    fontWeight: "500",
+    marginTop: 12,
+    marginBottom: 16,
+  },
+  footerNote: {
+    textAlign: "center",
+    color: "#94A3B8",
+    fontSize: 12,
+    marginTop: 12,
+  },
+  cardTitle: { fontSize: 16, fontWeight: "700", color: "#1E293B" },
+  cardSubtext: { fontSize: 12, color: "#64748B", marginTop: 2 },
+
+  // Icons
+  iconContainer: {
+    width: 64,
+    height: 64,
+    borderRadius: 32,
+    justifyContent: "center",
+    alignItems: "center",
+    marginBottom: 16,
+  },
+  scanIconWrapper: {
+    width: 80,
+    height: 80,
+    borderRadius: 40,
+    backgroundColor: "#F1F5F9",
+    justifyContent: "center",
+    alignItems: "center",
+  },
+  smallIcon: {
+    padding: 8,
+    borderRadius: 20,
+    marginRight: 12,
+  },
+
+  // Buttons
+  primaryButton: {
+    backgroundColor: "#2563EB",
+    paddingVertical: 14,
+    borderRadius: 12,
+    width: "100%",
+    alignItems: "center",
+    shadowColor: "#2563EB",
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.2,
+    shadowRadius: 3,
+    elevation: 2,
+  },
+  disabledButton: { backgroundColor: "#94A3B8" },
+  primaryButtonText: { color: "white", fontWeight: "600", fontSize: 16 },
+
+  actionButton: {
+    marginTop: 16,
+    flexDirection: "row",
+    alignItems: "center",
+    paddingVertical: 10,
+    paddingHorizontal: 20,
+    borderRadius: 10,
+  },
+  actionButtonText: { color: "white", fontWeight: "600", marginLeft: 8 },
+
+  // Colors
+  bgBlue: { backgroundColor: "#DBEAFE" },
+  bgGreen: { backgroundColor: "#D1FAE5" },
+  bgOrange: { backgroundColor: "#FEF3C7" },
+  bgRed: { backgroundColor: "#EF4444" },
+
+  // Modal
+  modalOverlay: {
+    flex: 1,
+    backgroundColor: "rgba(15, 23, 42, 0.6)",
+    justifyContent: "center",
+    alignItems: "center",
+  },
+  modalContent: {
+    backgroundColor: "white",
+    width: width * 0.85,
+    borderRadius: 24,
+    padding: 24,
+    shadowColor: "#000",
+    shadowOffset: { width: 0, height: 10 },
+    shadowOpacity: 0.25,
+    shadowRadius: 10,
+    elevation: 10,
+  },
+  modalHeader: { flexDirection: "row", marginBottom: 20 },
+  modalHeaderText: { flex: 1, marginLeft: 12 },
+  modalOption: {
+    flexDirection: "row",
+    alignItems: "center",
+    padding: 16,
+    borderRadius: 16,
+    borderWidth: 1,
+    marginBottom: 12,
+    backgroundColor: "#FAFAFA",
+  },
+  borderGreen: { borderColor: "#D1FAE5", backgroundColor: "#F0FDF4" },
+  borderRed: { borderColor: "#FEE2E2", backgroundColor: "#FEF2F2" },
+  optionTextContainer: { marginLeft: 12, flex: 1 },
+  optionTitle: { fontSize: 16, fontWeight: "700" },
+  optionSub: { fontSize: 12, color: "#64748B" },
+  closeButton: { marginTop: 8, padding: 12, alignItems: "center" },
+  closeButtonText: { color: "#64748B", fontWeight: "600" },
+
+  headerRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    marginBottom: 12,
+  },
+});
 
 export default InstructorView;

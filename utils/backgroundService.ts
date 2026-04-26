@@ -5,8 +5,7 @@ import { bleManager, bleUtils } from './bleUtils';
 import { Device } from 'react-native-ble-plx'; // ✅ Add this import
 
 let backgroundScanRunning = false;
-let backgroundScanInterval: NodeJS.Timeout | null = null;
-
+let backgroundScanInterval: ReturnType<typeof setInterval> | null = null;
 // ✅ Improved notification function
 // ✅ Improved notification function without deprecated properties
 const sendNotification = async (subjectCode: string, isTest = false) => {
